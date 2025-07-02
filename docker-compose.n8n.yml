@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: flowgenius-postgres
+    environment:
+      POSTGRES_DB: flowgenius_backups
+      POSTGRES_USER: n8n_user
+      POSTGRES_PASSWORD: n8n_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n_user -d flowgenius_backups"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - n8n-network
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: flowgenius-n8n
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: flowgenius_backups
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: n8n_user
+      DB_POSTGRESDB_PASSWORD: n8n_password
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678/
+      N8N_LOG_LEVEL: info
+      GENERIC_TIMEZONE: America/New_York
+      TZ: America/New_York
+      EXECUTIONS_PROCESS: main
+      EXECUTIONS_MODE: regular
+      EXECUTIONS_TIMEOUT: 3600
+      EXECUTIONS_MAX_TIMEOUT: 3600
+      NODE_FUNCTION_ALLOW_BUILTIN: '*'
+      NODE_FUNCTION_ALLOW_EXTERNAL: '*'
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./backups:/home/node/backups
+      - ./logs:/home/node/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - n8n-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  n8n_data:
+
+networks:
+  n8n-network: 

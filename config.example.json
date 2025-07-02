@@ -1,0 +1,45 @@
+{
+  "name": "FlowGenius Configuration",
+  "description": "Copy this file to config.json and fill in your actual values",
+  "api": {
+    "openai": {
+      "apiKey": "your_openai_api_key_here",
+      "model": "gpt-4",
+      "temperature": 0.1
+    },
+    "anthropic": {
+      "apiKey": "your_anthropic_api_key_here",
+      "model": "claude-3-sonnet"
+    }
+  },
+  "fileMonitoring": {
+    "watchDepth": 2,
+    "rateLimitDelay": 2000,
+    "ignoredExtensions": [".tmp", ".temp", ".log", ".lock"],
+    "ignoredDirectories": ["node_modules", ".git", ".DS_Store"]
+  },
+  "autoOrganization": {
+    "enabled": true,
+    "confidenceThreshold": 0.7,
+    "createDirectories": true,
+    "backupBeforeMove": true,
+    "maxBackupFiles": 100,
+    "dryRun": false
+  },
+  "workflows": {
+    "n8nHost": "localhost",
+    "n8nPort": 5678,
+    "enableN8NIntegration": false
+  },
+  "ui": {
+    "theme": "light",
+    "defaultTab": "browser",
+    "showConfidenceScores": true,
+    "enableNotifications": true
+  },
+  "logging": {
+    "level": "info",
+    "enableFileLogging": true,
+    "maxLogFiles": 10
+  }
+} 

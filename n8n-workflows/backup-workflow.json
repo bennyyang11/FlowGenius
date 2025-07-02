@@ -1,0 +1,147 @@
+{
+  "name": "File Organization Backup",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "backup-file",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-backup",
+      "name": "Webhook - Backup File",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "backup-file-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "file_backups",
+        "columns": "id, original_path, new_path, file_name, organization_method, workflow_id, created_at, metadata",
+        "additionalFields": {}
+      },
+      "id": "postgres-backup",
+      "name": "Store Backup Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-backup-db",
+          "name": "Backup Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.backup_type }}",
+              "operation": "equal",
+              "value2": "physical_copy"
+            }
+          ]
+        }
+      },
+      "id": "check-backup-type",
+      "name": "Check Backup Type",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "command": "cp \"{{ $json.original_path }}\" \"{{ $json.backup_path }}\""
+      },
+      "id": "physical-backup",
+      "name": "Create Physical Backup",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"success\": true, \"backup_id\": $json.id, \"message\": \"Backup created successfully\" } }}"
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"success\": false, \"error\": $json.error } }}",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "id": "error-response",
+      "name": "Error Response", 
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 500]
+    }
+  ],
+  "connections": {
+    "Webhook - Backup File": {
+      "main": [
+        [
+          {
+            "node": "Store Backup Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Backup Record": {
+      "main": [
+        [
+          {
+            "node": "Check Backup Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Backup Type": {
+      "main": [
+        [
+          {
+            "node": "Create Physical Backup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Physical Backup": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "id": "file-backup-workflow"
+} 
