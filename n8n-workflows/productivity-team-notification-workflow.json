@@ -1,0 +1,262 @@
+{
+  "name": "Productivity Team Notifications",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "team-notification",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-team-notification",
+      "name": "Webhook - Team Notification",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "team-notification-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst result = [];\n\nfor (const item of items) {\n  const data = item.json;\n  const fileInfo = data.file_info;\n  \n  // Format the notification message\n  const formattedMessage = `🗂️ **File Organized Successfully**\\n\\n` +\n    `📄 **File:** ${fileInfo.name}\\n` +\n    `📁 **Category:** ${fileInfo.category}\\n` +\n    `🎯 **Confidence:** ${Math.round(fileInfo.confidence * 100)}%\\n` +\n    `📍 **Location:** \\`${fileInfo.organized_path}\\`\\n` +\n    `🏷️ **Tags:** ${fileInfo.tags.join(', ')}\\n` +\n    `📊 **Size:** ${formatFileSize(fileInfo.size)}\\n\\n` +\n    `${data.options.mention_team ? '@channel ' : ''}${data.message}`;\n  \n  const blocks = [\n    {\n      \"type\": \"header\",\n      \"text\": {\n        \"type\": \"plain_text\",\n        \"text\": \"📁 File Organized\"\n      }\n    },\n    {\n      \"type\": \"section\",\n      \"fields\": [\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": `*File:*\\n${fileInfo.name}`\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": `*Category:*\\n${fileInfo.category}`\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": `*Confidence:*\\n${Math.round(fileInfo.confidence * 100)}%`\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": `*Size:*\\n${formatFileSize(fileInfo.size)}`\n        }\n      ]\n    },\n    {\n      \"type\": \"section\",\n      \"text\": {\n        \"type\": \"mrkdwn\",\n        \"text\": `*Location:* \\`${fileInfo.organized_path}\\`\\n*Tags:* ${fileInfo.tags.join(', ')}`\n      }\n    }\n  ];\n  \n  function formatFileSize(bytes) {\n    if (bytes === 0) return '0 Bytes';\n    const k = 1024;\n    const sizes = ['Bytes', 'KB', 'MB', 'GB'];\n    const i = Math.floor(Math.log(bytes) / Math.log(k));\n    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];\n  }\n  \n  result.push({\n    json: {\n      ...data,\n      formatted_message: formattedMessage,\n      slack_blocks: blocks,\n      discord_embed: {\n        title: \"📁 File Organized\",\n        color: 0x4CAF50,\n        fields: [\n          { name: \"File\", value: fileInfo.name, inline: true },\n          { name: \"Category\", value: fileInfo.category, inline: true },\n          { name: \"Confidence\", value: `${Math.round(fileInfo.confidence * 100)}%`, inline: true },\n          { name: \"Location\", value: `\\`${fileInfo.organized_path}\\``, inline: false },\n          { name: \"Tags\", value: fileInfo.tags.join(', '), inline: false }\n        ],\n        timestamp: new Date().toISOString()\n      }\n    }\n  });\n}\n\nreturn result;"
+      },
+      "id": "format-message",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.integration }}",
+              "rightValue": "slack",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "route-by-platform",
+      "name": "Route by Platform",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "postMessage",
+        "channel": "={{ $json.channel }}",
+        "text": "={{ $json.formatted_message }}",
+        "attachments": [],
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "section",
+              "sectionValue": {
+                "type": "text",
+                "textValue": {
+                  "type": "mrkdwn",
+                  "text": "={{ $json.formatted_message }}"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "id": "slack-message",
+      "name": "Send Slack Message",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [900, 200],
+      "credentials": {
+        "slackApi": {
+          "id": "slack-api",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "channelId": "={{ $json.channel }}",
+        "messageText": "={{ $json.formatted_message }}"
+      },
+      "id": "teams-message",
+      "name": "Send Teams Message",
+      "type": "n8n-nodes-base.microsoftTeams",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "credentials": {
+        "microsoftTeamsOAuth2Api": {
+          "id": "teams-oauth",
+          "name": "Microsoft Teams OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "webhookUrl": "={{ $json.discord_webhook_url }}",
+        "content": "={{ $json.formatted_message }}",
+        "options": {
+          "embeds": [
+            "={{ $json.discord_embed }}"
+          ]
+        }
+      },
+      "id": "discord-message",
+      "name": "Send Discord Message",
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 1,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst result = [];\n\nfor (const item of items) {\n  const success = item.json.error === undefined;\n  const response = {\n    success: success,\n    message: success ? 'Team notification sent successfully' : 'Failed to send team notification',\n    platform: $('Webhook - Team Notification').first().json.integration,\n    channel: $('Webhook - Team Notification').first().json.channel,\n    message_id: item.json.ts || item.json.id || item.json.message_id || 'unknown',\n    timestamp: new Date().toISOString(),\n    error: item.json.error || null\n  };\n  \n  result.push({ json: response });\n}\n\nreturn result;"
+      },
+      "id": "format-response",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Team Notification": {
+      "main": [
+        [
+          {
+            "node": "Format Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Message": {
+      "main": [
+        [
+          {
+            "node": "Route by Platform",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Platform": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Teams Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Discord Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Teams Message": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Discord Message": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "flowgenius-productivity-integration"
+  },
+  "id": "productivity-team-notification",
+  "tags": [
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "team-collaboration",
+      "name": "team-collaboration"
+    },
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "productivity",
+      "name": "productivity"
+    }
+  ]
+} 

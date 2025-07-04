@@ -34,6 +34,8 @@ function App() {
   const [loading, setLoading] = React.useState(false);
   const [organizationMethod, setOrganizationMethod] = React.useState('ai-smart');
   const [undoModalOpen, setUndoModalOpen] = React.useState(false);
+  
+
   const [backupRecords, setBackupRecords] = React.useState([]);
   
   // Search state
@@ -41,6 +43,29 @@ function App() {
   const [searchQuery, setSearchQuery] = React.useState('');
   const [searchLoading, setSearchLoading] = React.useState(false);
   const [searchHistory, setSearchHistory] = React.useState([]);
+
+  // Google Drive sync state (global to persist across tab switches)
+  const [syncStatus, setSyncStatus] = React.useState({
+    isEnabled: false,
+    isRunning: false,
+    progress: 0,
+    totalFiles: 0,
+    processedFiles: 0,
+    successCount: 0,
+    errorCount: 0,
+    currentFile: null,
+    results: [],
+    scanning: false,
+    recentFiles: [], // Track recently processed files for live feed
+    startTime: null
+  });
+
+  const [googleDriveAuthStatus, setGoogleDriveAuthStatus] = React.useState({
+    isAuthenticated: false,
+    user: null,
+    configured: false,
+    loading: false
+  });
 
   // Initialize app
   React.useEffect(() => {
@@ -450,6 +475,369 @@ function App() {
     setUndoModalOpen(true);
   };
 
+  // Google Drive Authentication Functions (moved to App level for persistence)
+  const loadGoogleDriveAuthStatus = async () => {
+    try {
+      setGoogleDriveAuthStatus(prev => ({ ...prev, loading: true }));
+      const status = await ipcRenderer.invoke('google-drive-auth-status');
+      setGoogleDriveAuthStatus({
+        ...status,
+        loading: false
+      });
+      
+      // Update sync status based on authentication state
+      setSyncStatus(prev => ({
+        ...prev,
+        isEnabled: status.isAuthenticated && status.configured
+      }));
+    } catch (error) {
+      console.error('Failed to load Google Drive auth status:', error);
+      setGoogleDriveAuthStatus({
+        isAuthenticated: false,
+        user: null,
+        configured: false,
+        loading: false,
+        error: error.message
+      });
+      
+      // Set sync as disabled if auth check failed
+      setSyncStatus(prev => ({
+        ...prev,
+        isEnabled: false
+      }));
+    }
+  };
+
+  const handleGoogleDriveSignIn = async () => {
+    try {
+      setGoogleDriveAuthStatus(prev => ({ ...prev, loading: true }));
+      const result = await ipcRenderer.invoke('google-drive-authenticate');
+      
+      if (result.success) {
+        // Reload auth status from backend to ensure consistency
+        await loadGoogleDriveAuthStatus();
+        
+        // Show success notification
+        if (window.showNotification) {
+          window.showNotification('✅ Successfully signed in to Google Drive!', 'success');
+        }
+      } else {
+        throw new Error(result.error || 'Authentication failed');
+      }
+    } catch (error) {
+      console.error('Google Drive sign in failed:', error);
+      setGoogleDriveAuthStatus(prev => ({ 
+        ...prev, 
+        loading: false, 
+        error: error.message 
+      }));
+      
+      // Show error notification
+      if (window.showNotification) {
+        window.showNotification('❌ Google Drive sign in failed: ' + error.message, 'error');
+      }
+    }
+  };
+
+  const handleGoogleDriveSignOut = async () => {
+    try {
+      setGoogleDriveAuthStatus(prev => ({ ...prev, loading: true }));
+      const result = await ipcRenderer.invoke('google-drive-sign-out');
+      
+      if (result.success) {
+        // Reload auth status from backend to ensure consistency
+        await loadGoogleDriveAuthStatus();
+        
+        // Show success notification
+        if (window.showNotification) {
+          window.showNotification('✅ Successfully signed out from Google Drive', 'success');
+        }
+      } else {
+        throw new Error(result.error || 'Sign out failed');
+      }
+    } catch (error) {
+      console.error('Google Drive sign out failed:', error);
+      setGoogleDriveAuthStatus(prev => ({ 
+        ...prev, 
+        loading: false, 
+        error: error.message 
+      }));
+      
+      // Show error notification
+      if (window.showNotification) {
+        window.showNotification('❌ Google Drive sign out failed: ' + error.message, 'error');
+      }
+    }
+  };
+
+  // Load Google Drive auth status when app initializes
+  React.useEffect(() => {
+    if (user) {
+      loadGoogleDriveAuthStatus();
+    }
+  }, [user]);
+
+  // Cloud Sync Functions (moved to App level for persistence)
+  React.useEffect(() => {
+    const { ipcRenderer } = window.require('electron');
+    
+    // Load cloud sync status on component mount (non-blocking)
+    const loadCloudSyncStatus = async () => {
+      try {
+        const status = await ipcRenderer.invoke('get-cloud-sync-status');
+        setSyncStatus(prev => ({
+          ...prev,
+          isEnabled: status.enabled
+        }));
+      } catch (error) {
+        console.error('Failed to load cloud sync status:', error);
+      }
+    };
+
+    // Load status asynchronously to avoid blocking UI
+    setTimeout(() => {
+      loadCloudSyncStatus();
+    }, 50);
+
+    // Listen for sync progress updates (with debugging)
+    const handleSyncProgress = (event, data) => {
+      console.log(`📊 FRONTEND RECEIVED: ${data.processedFiles || 0}/${data.totalFiles || 0} files`);
+      console.log('📊 Full data received:', data);
+      console.log('📊 Scanning status:', data.scanning);
+      console.log('📊 Current file:', data.currentFile);
+      
+      setSyncStatus(prev => {
+        const newState = {
+          ...prev,
+          isRunning: data.isRunning !== undefined ? data.isRunning : prev.isRunning,
+          progress: data.progress !== undefined ? data.progress : prev.progress,
+          totalFiles: data.totalFiles !== undefined ? data.totalFiles : prev.totalFiles,
+          processedFiles: data.processedFiles !== undefined ? data.processedFiles : prev.processedFiles,
+          successCount: data.successCount !== undefined ? data.successCount : prev.successCount,
+          errorCount: data.errorCount !== undefined ? data.errorCount : prev.errorCount,
+          currentFile: data.currentFile !== undefined ? data.currentFile : prev.currentFile,
+          scanning: data.scanning !== undefined ? data.scanning : false // Default to false if not specified
+        };
+
+        // Force scanning to false if we have actual progress data
+        if (data.totalFiles > 0 && data.processedFiles !== undefined) {
+          newState.scanning = false;
+        }
+
+        // Add recently processed file to the feed (only if not scanning and currentFile changed)
+        if (!newState.scanning && data.currentFile && data.currentFile !== prev.currentFile && data.processedFiles > (prev.processedFiles || 0)) {
+          const fileName = data.currentFile.split('/').pop();
+          const fileEntry = {
+            id: Date.now() + Math.random(), // Ensure unique ID
+            fileName: fileName,
+            fullPath: data.currentFile,
+            timestamp: new Date(),
+            status: 'processing',
+            processedIndex: data.processedFiles
+          };
+          
+          // Mark previous file as completed if it exists
+          const updatedRecentFiles = prev.recentFiles.map(file => {
+            if (file.status === 'processing' && file.processedIndex === (data.processedFiles - 1)) {
+              return {
+                ...file,
+                status: 'success',
+                completedAt: new Date()
+              };
+            }
+            return file;
+          });
+          
+          newState.recentFiles = [fileEntry, ...updatedRecentFiles.slice(0, 49)]; // Keep last 50 files
+        }
+
+        // Set start time when sync actually begins (has totalFiles and not scanning)
+        if (!prev.startTime && data.isRunning && newState.totalFiles > 0 && !newState.scanning) {
+          newState.startTime = new Date();
+          console.log('🚀 Setting sync start time - totalFiles:', newState.totalFiles);
+        }
+        
+        console.log('📊 Setting new sync status:', newState);
+        return newState;
+      });
+    };
+
+    const handleSyncComplete = (event, data) => {
+      console.log('✅ Sync complete:', data);
+      setSyncStatus(prev => ({
+        ...prev,
+        isRunning: false,
+        progress: 100,
+        results: data.results || [],
+        startTime: null // Reset start time
+      }));
+    };
+
+    // Listen for individual file sync completions
+    const handleMonitoringUpdate = (event, data) => {
+      if (data.type === 'cloud-sync-success' || data.type === 'cloud-sync-error') {
+        let fileName = '';
+        
+        // Extract filename from different message formats
+        if (data.filePath) {
+          fileName = data.filePath.split('/').pop();
+        } else if (data.message) {
+          // Handle messages like "✅ Synced to Google Drive: filename.ext"
+          const match = data.message.match(/(?:Synced to Google Drive:|Sync failed:)\s*(.+)$/);
+          if (match) {
+            fileName = match[1];
+          }
+        }
+        
+        const isSuccess = data.type === 'cloud-sync-success';
+        
+        console.log(`📋 Updating file status: ${fileName} -> ${isSuccess ? 'success' : 'error'}`);
+        
+        setSyncStatus(prev => ({
+          ...prev,
+          recentFiles: prev.recentFiles.map(file => {
+            if (file.fileName === fileName || file.fileName.includes(fileName)) {
+              console.log(`✅ Found matching file: ${file.fileName}`);
+              return {
+                ...file,
+                status: isSuccess ? 'success' : 'error',
+                completedAt: new Date(),
+                error: isSuccess ? null : data.details
+              };
+            }
+            return file;
+          })
+        }));
+      }
+    };
+
+    // Add event listeners with debugging
+    console.log('📡 Setting up sync event listeners...');
+    console.log('📡 IPC Renderer available:', !!window.require);
+    
+    try {
+      ipcRenderer.on('bulk-sync-progress', handleSyncProgress);
+      ipcRenderer.on('bulk-sync-complete', handleSyncComplete);
+      ipcRenderer.on('monitoring-update', handleMonitoringUpdate);
+      console.log('✅ Event listeners registered successfully');
+      
+      // Test IPC communication immediately
+      ipcRenderer.invoke('test-ipc-communication').then(result => {
+        console.log('🧪 IPC Test Result:', result);
+      }).catch(error => {
+        console.error('❌ IPC Test Failed:', error);
+      });
+      
+    } catch (error) {
+      console.error('❌ Failed to register event listeners:', error);
+    }
+
+    // Simple IPC connection verification (non-blocking)
+    console.log('✅ IPC setup complete');
+
+    return () => {
+      console.log('🔌 Removing sync event listeners...');
+      ipcRenderer.removeListener('bulk-sync-progress', handleSyncProgress);
+      ipcRenderer.removeListener('bulk-sync-complete', handleSyncComplete);
+      ipcRenderer.removeListener('monitoring-update', handleMonitoringUpdate);
+    };
+  }, []);
+
+  const startBulkCloudSync = async () => {
+    const confirmed = confirm(
+      'Sync all files to Google Drive?\n\n' +
+      'This will analyze and upload all files in your monitored directories (Desktop, Documents, Downloads) to Google Drive.\n\n' +
+      'The process may take several minutes depending on the number of files.'
+    );
+    
+    if (!confirmed) return;
+
+    try {
+      console.log('🚀 Starting bulk cloud sync from UI...');
+      
+      // Set initial state
+      setSyncStatus(prev => ({
+        ...prev,
+        isRunning: true,
+        progress: 0,
+        totalFiles: 0,
+        processedFiles: 0,
+        successCount: 0,
+        errorCount: 0,
+        currentFile: 'Starting sync...',
+        results: [],
+        scanning: true,
+        recentFiles: [], // Reset recent files for new sync
+        startTime: null // Will be set when actual sync begins
+      }));
+      
+      console.log('🚀 Initial sync state set - scanning mode active');
+
+      // Force UI refresh after state update
+      setTimeout(() => {
+        console.log('🔄 Force checking if sync is still in scanning mode...');
+        setSyncStatus(current => {
+          if (current.scanning && current.isRunning && current.totalFiles === 0) {
+            console.log('⚠️ Still scanning after 10 seconds, this might indicate an issue');
+          }
+          return current;
+        });
+      }, 10000);
+
+      // Start the sync process (non-blocking)
+      const result = await ipcRenderer.invoke('start-bulk-cloud-sync');
+      
+      if (!result.success) {
+        console.error('Failed to start bulk sync:', result.error);
+        alert(`Failed to start bulk sync: ${result.error}`);
+        setSyncStatus(prev => ({
+          ...prev,
+          isRunning: false
+        }));
+      } else {
+        console.log('✅ Bulk sync started successfully');
+        
+        // Add a debug check after 5 seconds
+        setTimeout(() => {
+          console.log('🔍 Debug check after 5 seconds...');
+          console.log('📊 Current sync status:', JSON.stringify({
+            isRunning: syncStatus.isRunning,
+            scanning: syncStatus.scanning,
+            totalFiles: syncStatus.totalFiles,
+            processedFiles: syncStatus.processedFiles,
+            currentFile: syncStatus.currentFile
+          }, null, 2));
+          
+          // Test if we can manually trigger an event
+          ipcRenderer.invoke('test-sync-events').then(result => {
+            console.log('🧪 Sync Events Test Result:', result);
+          }).catch(error => {
+            console.error('❌ Sync Events Test Failed:', error);
+          });
+        }, 5000);
+      }
+    } catch (error) {
+      console.error('Failed to start bulk sync:', error);
+      alert('Failed to start bulk sync. Please try again.');
+      setSyncStatus(prev => ({
+        ...prev,
+        isRunning: false
+      }));
+    }
+  };
+
+  const stopBulkCloudSync = async () => {
+    try {
+      await ipcRenderer.invoke('stop-bulk-cloud-sync');
+      setSyncStatus(prev => ({
+        ...prev,
+        isRunning: false
+      }));
+    } catch (error) {
+      console.error('Failed to stop bulk sync:', error);
+    }
+  };
+
   // Show loading screen while checking auth
   if (authLoading) {
     return React.createElement('div', { className: 'app-loading' },
@@ -545,7 +933,17 @@ function App() {
         demoMode,
         setDemoMode,
         demoDirectory,
-        onDirectoryChange: loadDirectoryContents
+        onDirectoryChange: loadDirectoryContents,
+        isActive: activeTab === 'settings',
+        syncStatus,
+        setSyncStatus,
+        googleDriveAuthStatus,
+        setGoogleDriveAuthStatus,
+        loadGoogleDriveAuthStatus,
+        handleGoogleDriveSignIn,
+        handleGoogleDriveSignOut,
+        startBulkCloudSync,
+        stopBulkCloudSync
       })
     ),
 
@@ -1457,6 +1855,21 @@ function MonitoringPanel({ status, organizationSuggestions }) {
   });
   const [queueSimulating, setQueueSimulating] = React.useState(false);
 
+  // Add productivity integration state
+  const [productivityStatus, setProductivityStatus] = React.useState({
+    isEnabled: false,
+    availableIntegrations: [],
+    activeIntegrations: [],
+    cloudSyncStatus: {
+      isActive: false,
+      provider: null,
+      lastSync: null,
+      totalSynced: 0,
+      syncErrors: 0
+    },
+    recentSyncActivity: []
+  });
+
   React.useEffect(() => {
     // Listen for monitoring events
     const { ipcRenderer } = window.require('electron');
@@ -1503,9 +1916,76 @@ function MonitoringPanel({ status, organizationSuggestions }) {
       }));
     };
 
+    // Add productivity integration event listeners
+    const handleProductivityUpdate = (event, data) => {
+      console.log('Productivity integration event:', data);
+      
+      setProductivityStatus(prev => ({
+        ...prev,
+        recentSyncActivity: [
+          {
+            id: Date.now(),
+            timestamp: new Date(),
+            type: data.type || 'cloud-sync',
+            integration: data.integration || 'google-drive',
+            fileName: data.fileName,
+            success: data.success,
+            message: data.message,
+            details: data.details
+          },
+          ...prev.recentSyncActivity.slice(0, 19) // Keep last 20 sync events
+        ],
+        cloudSyncStatus: {
+          ...prev.cloudSyncStatus,
+          isActive: data.type === 'sync-started',
+          provider: data.integration || prev.cloudSyncStatus.provider,
+          lastSync: data.success ? new Date() : prev.cloudSyncStatus.lastSync,
+          totalSynced: data.success ? prev.cloudSyncStatus.totalSynced + 1 : prev.cloudSyncStatus.totalSynced,
+          syncErrors: data.success ? prev.cloudSyncStatus.syncErrors : prev.cloudSyncStatus.syncErrors + 1
+        }
+      }));
+
+      // Also add to main activity feed
+      setMonitoringData(prev => ({
+        ...prev,
+        recentActivity: [
+          {
+            id: Date.now(),
+            timestamp: new Date(),
+            type: data.success ? 'cloud-sync-success' : 'cloud-sync-error',
+            message: data.success ? 
+              `📤 Successfully synced ${data.fileName} to ${data.integration}` :
+              `❌ Failed to sync ${data.fileName} to ${data.integration}: ${data.message}`,
+            filePath: data.filePath,
+            details: data.details
+          },
+          ...prev.recentActivity.slice(0, 49)
+        ]
+      }));
+    };
+
+    // Cloud sync stats update handler
+    const handleCloudSyncStatsUpdate = (event, data) => {
+      console.log('📊 Frontend received cloud-sync-stats-update:', data);
+      setProductivityStatus(prev => ({
+        ...prev,
+        cloudSyncStatus: {
+          ...prev.cloudSyncStatus,
+          totalSynced: data.totalSynced,
+          syncErrors: data.syncErrors,
+          lastSync: data.lastSync ? new Date(data.lastSync) : null,
+          isActive: data.isActive
+        }
+      }));
+    };
+
+    // Register event listeners
     ipcRenderer.on('monitoring-update', handleMonitoringUpdate);
     ipcRenderer.on('system-status', handleSystemStatus);
     ipcRenderer.on('queue-status', handleQueueStatus);
+    ipcRenderer.on('productivity-integration-update', handleProductivityUpdate);
+    ipcRenderer.on('cloud-sync-update', handleProductivityUpdate);
+    ipcRenderer.on('cloud-sync-stats-update', handleCloudSyncStatsUpdate);
 
     // Request initial status
     ipcRenderer.invoke('get-monitoring-status').then(data => {
@@ -1517,16 +1997,97 @@ function MonitoringPanel({ status, organizationSuggestions }) {
       }
     });
 
+    // Load productivity integration status
+    const loadProductivityStatus = async () => {
+      try {
+        const integrations = await ipcRenderer.invoke('get-productivity-integrations');
+        const cloudSyncEnabled = await ipcRenderer.invoke('get-cloud-sync-status');
+        
+        setProductivityStatus(prev => ({
+          ...prev,
+          isEnabled: integrations && integrations.length > 0,
+          availableIntegrations: integrations || [],
+          activeIntegrations: integrations ? integrations.filter(i => i.enabled) : [],
+          cloudSyncStatus: {
+            ...prev.cloudSyncStatus,
+            isActive: cloudSyncEnabled?.enabled || false,
+            provider: cloudSyncEnabled?.provider || 'google-drive'
+          }
+        }));
+      } catch (error) {
+        console.error('Failed to load productivity status:', error);
+      }
+    };
+
+    loadProductivityStatus();
+
     return () => {
       ipcRenderer.removeListener('monitoring-update', handleMonitoringUpdate);
       ipcRenderer.removeListener('system-status', handleSystemStatus);
       ipcRenderer.removeListener('queue-status', handleQueueStatus);
+      ipcRenderer.removeListener('productivity-integration-update', handleProductivityUpdate);
+      ipcRenderer.removeListener('cloud-sync-update', handleProductivityUpdate);
+      ipcRenderer.removeListener('cloud-sync-stats-update', handleCloudSyncStatsUpdate);
     };
   }, []);
 
   const triggerTestEvent = async (eventType) => {
     const { ipcRenderer } = window.require('electron');
     await ipcRenderer.invoke('trigger-test-monitoring-event', eventType);
+  };
+
+  // Add productivity integration test function
+  const testProductivityIntegration = async (integrationType) => {
+    const { ipcRenderer } = window.require('electron');
+    try {
+      console.log(`Testing ${integrationType} integration...`);
+      const result = await ipcRenderer.invoke('test-productivity-integration', integrationType);
+      console.log(`${integrationType} test result:`, result);
+      
+      // Simulate the event for UI feedback
+      const testEvent = {
+        type: 'test-sync',
+        integration: integrationType,
+        fileName: 'test-file.txt',
+        success: result.success,
+        message: result.message || (result.success ? 'Test successful' : 'Test failed'),
+        details: result.details || JSON.stringify(result)
+      };
+      
+      // Send to our handler
+      const event = { preventDefault: () => {} };
+      const handleProductivityUpdate = (event, data) => {
+        console.log('Productivity integration event:', data);
+        
+        setProductivityStatus(prev => ({
+          ...prev,
+          recentSyncActivity: [
+            {
+              id: Date.now(),
+              timestamp: new Date(),
+              type: data.type || 'cloud-sync',
+              integration: data.integration || 'google-drive',
+              fileName: data.fileName,
+              success: data.success,
+              message: data.message,
+              details: data.details
+            },
+            ...prev.recentSyncActivity.slice(0, 19)
+          ],
+          cloudSyncStatus: {
+            ...prev.cloudSyncStatus,
+            lastSync: data.success ? new Date() : prev.cloudSyncStatus.lastSync,
+            totalSynced: data.success ? prev.cloudSyncStatus.totalSynced + 1 : prev.cloudSyncStatus.totalSynced,
+            syncErrors: data.success ? prev.cloudSyncStatus.syncErrors : prev.cloudSyncStatus.syncErrors + 1
+          }
+        }));
+      };
+      
+      handleProductivityUpdate(event, testEvent);
+      
+    } catch (error) {
+      console.error(`Failed to test ${integrationType}:`, error);
+    }
   };
 
   const startQueueSimulation = async () => {
@@ -1574,6 +2135,15 @@ function MonitoringPanel({ status, organizationSuggestions }) {
       totalFiles: 0,
       currentFile: null
     });
+    setProductivityStatus(prev => ({
+      ...prev,
+      recentSyncActivity: [],
+      cloudSyncStatus: {
+        ...prev.cloudSyncStatus,
+        totalSynced: 0,
+        syncErrors: 0
+      }
+    }));
   };
 
   const formatTime = (date) => {
@@ -1588,6 +2158,9 @@ function MonitoringPanel({ status, organizationSuggestions }) {
       case 'file-error': return '⚠️';
       case 'search-completed': return '🔍';
       case 'system-start': return '🚀';
+      case 'cloud-sync-success': return '☁️';
+      case 'cloud-sync-error': return '❌';
+      case 'cloud-sync-complete': return '✅';
       default: return '📊';
     }
   };
@@ -1599,8 +2172,19 @@ function MonitoringPanel({ status, organizationSuggestions }) {
       case 'file-organized': return '#805ad5';
       case 'file-error': return '#e53e3e';
       case 'search-completed': return '#ed8936';
+      case 'cloud-sync-success': return '#38a169';
+      case 'cloud-sync-error': return '#e53e3e';
+      case 'cloud-sync-complete': return '#38a169';
       default: return '#718096';
     }
+  };
+
+  const getSyncStatusColor = (success) => {
+    return success ? '#38a169' : '#e53e3e';
+  };
+
+  const getSyncStatusIcon = (success) => {
+    return success ? '✅' : '❌';
   };
 
   return React.createElement('div', { className: 'monitoring-panel' },
@@ -1684,7 +2268,118 @@ function MonitoringPanel({ status, organizationSuggestions }) {
             }, monitoringData.statistics.errorsEncountered)
           )
         )
+      ),
+
+      // Productivity Integration Status Card
+      React.createElement('div', { className: 'status-card' },
+        React.createElement('div', { className: 'status-header productivity-header' },
+          React.createElement('span', { className: 'status-icon' }, '🚀'),
+          React.createElement('span', { className: 'status-title' }, 'Productivity Integrations')
+        ),
+        React.createElement('div', { className: 'status-content' },
+          React.createElement('div', { className: 'status-item' },
+            React.createElement('span', { className: 'status-label' }, 'Service Status:'),
+            React.createElement('span', { 
+              className: 'status-value',
+              style: { color: productivityStatus.isEnabled ? '#38a169' : '#718096' }
+            }, productivityStatus.isEnabled ? 'Enabled' : 'Disabled')
+          ),
+          React.createElement('div', { className: 'status-item' },
+            React.createElement('span', { className: 'status-label' }, 'Available Integrations:'),
+            React.createElement('span', { className: 'status-value' }, 
+              productivityStatus.availableIntegrations.length || 6
+            )
+          ),
+          React.createElement('div', { className: 'status-item' },
+            React.createElement('span', { className: 'status-label' }, 'Google Drive Sync:'),
+            React.createElement('span', { 
+              className: 'status-value',
+              style: { color: productivityStatus.cloudSyncStatus.provider === 'google-drive' ? '#38a169' : '#718096' }
+            }, productivityStatus.cloudSyncStatus.provider === 'google-drive' ? 'Ready' : 'Not Configured')
+          ),
+          React.createElement('div', { className: 'status-item' },
+            React.createElement('span', { className: 'status-label' }, 'Files Synced:'),
+            React.createElement('span', { className: 'status-value' }, 
+              productivityStatus.cloudSyncStatus.totalSynced
+            )
+          )
+        )
       )
+    ),
+
+    // Cloud Sync Activity Section
+    React.createElement('div', { className: 'cloud-sync-section' },
+      React.createElement('h3', null, 
+        '☁️ Cloud Sync Activity ',
+        React.createElement('span', { className: 'sync-status' }, 
+          productivityStatus.cloudSyncStatus.isActive ? 
+            React.createElement('span', { 
+              className: 'status-indicator active',
+              style: { color: '#38a169' }
+            }, '🟢 Active') :
+            React.createElement('span', { 
+              className: 'status-indicator idle',
+              style: { color: '#718096' }
+            }, '⚪ Idle')
+        )
+      ),
+      
+      React.createElement('div', { className: 'sync-stats' },
+        React.createElement('div', { className: 'sync-stat' },
+          React.createElement('span', { className: 'stat-label' }, 'Total Synced:'),
+          React.createElement('span', { className: 'stat-value' }, productivityStatus.cloudSyncStatus.totalSynced)
+        ),
+        React.createElement('div', { className: 'sync-stat' },
+          React.createElement('span', { className: 'stat-label' }, 'Sync Errors:'),
+          React.createElement('span', { 
+            className: 'stat-value',
+            style: { color: productivityStatus.cloudSyncStatus.syncErrors > 0 ? '#e53e3e' : '#38a169' }
+          }, productivityStatus.cloudSyncStatus.syncErrors)
+        ),
+        React.createElement('div', { className: 'sync-stat' },
+          React.createElement('span', { className: 'stat-label' }, 'Last Sync:'),
+          React.createElement('span', { className: 'stat-value' }, 
+            productivityStatus.cloudSyncStatus.lastSync ? 
+              formatTime(productivityStatus.cloudSyncStatus.lastSync) : 'Never'
+          )
+        )
+      ),
+
+      // Recent Sync Activity
+      productivityStatus.recentSyncActivity.length > 0 && 
+        React.createElement('div', { className: 'recent-sync-activity' },
+          React.createElement('h4', null, '📤 Recent Sync Activity'),
+          React.createElement('div', { className: 'sync-activity-list' },
+            productivityStatus.recentSyncActivity.slice(0, 5).map(activity =>
+              React.createElement('div', { 
+                key: activity.id, 
+                className: 'sync-activity-item',
+                style: { borderLeftColor: getSyncStatusColor(activity.success) }
+              },
+                React.createElement('div', { className: 'sync-activity-header' },
+                  React.createElement('span', { className: 'sync-activity-icon' }, 
+                    getSyncStatusIcon(activity.success)
+                  ),
+                  React.createElement('span', { className: 'sync-activity-time' }, 
+                    formatTime(activity.timestamp)
+                  ),
+                  React.createElement('span', { className: 'sync-activity-integration' }, 
+                    activity.integration.toUpperCase()
+                  )
+                ),
+                React.createElement('div', { className: 'sync-activity-message' }, 
+                  activity.success ? 
+                    `✅ Successfully synced ${activity.fileName}` :
+                    `❌ Failed to sync ${activity.fileName}`
+                ),
+                activity.message !== (activity.success ? 'Test successful' : 'Test failed') && 
+                  React.createElement('div', { className: 'sync-activity-details' }, 
+                    activity.message
+                  )
+              )
+            )
+          )
+        )
     ),
 
     // Queue Simulation Controls
@@ -1775,6 +2470,27 @@ function MonitoringPanel({ status, organizationSuggestions }) {
           className: 'btn btn-outline btn-sm',
           onClick: () => triggerTestEvent('search-completed')
         }, '🔍 Simulate Search')
+      ),
+      
+      // NEW: Productivity Integration Test Buttons
+      React.createElement('div', { className: 'productivity-test-section' },
+        React.createElement('h4', null, '🚀 Productivity Integration Tests'),
+        React.createElement('div', { className: 'productivity-test-buttons' },
+          React.createElement('button', {
+            className: 'btn btn-success btn-sm',
+            onClick: () => testProductivityIntegration('cloud-sync')
+          }, '☁️ Test Google Drive Sync'),
+          
+          React.createElement('button', {
+            className: 'btn btn-info btn-sm',
+            onClick: () => testProductivityIntegration('team-notification')
+          }, '📢 Test Team Notifications'),
+          
+          React.createElement('button', {
+            className: 'btn btn-warning btn-sm',
+            onClick: () => testProductivityIntegration('smart-backup')
+          }, '💾 Test Smart Backup')
+        )
       )
     ),
 
@@ -2183,9 +2899,1765 @@ function DemoExplorer({ demoDirectory, onFileAnalyze, aiAnalysis, organizationSu
   );
 }
 
+// Advanced Triggers Component Functions - moved outside SettingsPanel to prevent redefinition
+function TriggerEditModal({ trigger, onSave, onClose }) {
+  const [formData, setFormData] = React.useState(() => {
+    // Parse time from schedule string
+    const timeMatch = trigger.schedule.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    let time = '02:00';
+    
+    if (timeMatch) {
+      let hours = parseInt(timeMatch[1]);
+      const minutes = timeMatch[2];
+      const ampm = timeMatch[3].toUpperCase();
+      
+      if (ampm === 'PM' && hours !== 12) {
+        hours += 12;
+      } else if (ampm === 'AM' && hours === 12) {
+        hours = 0;
+      }
+      
+      time = `${hours.toString().padStart(2, '0')}:${minutes}`;
+    }
+    
+    return {
+      name: trigger.name,
+      description: trigger.description,
+      action: trigger.action === 'Clean up temporary files' ? 'cleanup-temp-files' : 
+              trigger.action === 'Organize Downloads folder' ? 'organize-downloads' :
+              trigger.action === 'Archive old files' ? 'archive-old-files' : 'cleanup-temp-files',
+      schedule: trigger.schedule === 'Daily at 2:00 AM' ? 'daily' :
+                trigger.schedule === 'Every hour' ? 'hourly' :
+                trigger.schedule === 'Weekly on Sunday' ? 'weekly' : 'daily',
+      time: time,
+      enabled: trigger.enabled
+    };
+  });
+
+  const actionOptions = [
+    { id: 'cleanup-temp-files', name: 'Clean up temporary files' },
+    { id: 'organize-downloads', name: 'Organize Downloads folder' },
+    { id: 'archive-old-files', name: 'Archive old files' }
+  ];
+
+  const scheduleOptions = [
+    { id: 'hourly', name: 'Every hour' },
+    { id: 'daily', name: 'Daily' },
+    { id: 'weekly', name: 'Weekly' }
+  ];
+
+  // Handle escape key
+  React.useEffect(() => {
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [onClose]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    
+    if (!formData.name.trim()) {
+      alert('Please enter a trigger name');
+      return;
+    }
+
+    // Convert back to display format for UI
+    let displaySchedule = scheduleOptions.find(s => s.id === formData.schedule)?.name || formData.schedule;
+    
+    // Format time for display if it's daily or weekly
+    if (formData.schedule === 'daily' || formData.schedule === 'weekly') {
+      const [hours, minutes] = formData.time.split(':').map(Number);
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      const displayHours = hours === 0 ? 12 : hours > 12 ? hours - 12 : hours;
+      const timeString = `${displayHours}:${minutes.toString().padStart(2, '0')} ${ampm}`;
+      
+      if (formData.schedule === 'daily') {
+        displaySchedule = `Daily at ${timeString}`;
+      } else {
+        displaySchedule = `Weekly on Sunday at ${timeString}`;
+      }
+    }
+    
+    const updatedData = {
+      ...formData,
+      action: actionOptions.find(a => a.id === formData.action)?.name || formData.action,
+      schedule: displaySchedule
+    };
+
+    onSave(updatedData);
+  };
+
+  return React.createElement('div', {
+    style: {
+      position: 'fixed',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      background: 'rgba(0, 0, 0, 0.5)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      zIndex: 1000,
+      backdropFilter: 'blur(4px)'
+    },
+    onClick: (e) => {
+      if (e.target === e.currentTarget) {
+        onClose();
+      }
+    }
+  },
+    React.createElement('div', {
+      style: {
+        background: 'white',
+        borderRadius: '12px',
+        padding: '24px',
+        width: '90%',
+        maxWidth: '500px',
+        maxHeight: '90vh',
+        overflow: 'auto',
+        boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)',
+        margin: '20px'
+      },
+      onClick: (e) => e.stopPropagation()
+    },
+      React.createElement('div', { 
+        style: { 
+          display: 'flex', 
+          justifyContent: 'space-between', 
+          alignItems: 'center',
+          marginBottom: '20px'
+        }
+      },
+        React.createElement('h4', { style: { margin: '0', fontSize: '20px', fontWeight: '600' } }, 
+          `Edit Trigger`
+        ),
+        React.createElement('button', {
+          onClick: onClose,
+          style: {
+            background: 'none',
+            border: 'none',
+            fontSize: '24px',
+            cursor: 'pointer',
+            color: '#6b7280',
+            padding: '4px'
+          }
+        }, '×')
+      ),
+
+      React.createElement('form', { onSubmit: handleSubmit },
+        React.createElement('div', { 
+          style: { 
+            display: 'grid', 
+            gap: '16px',
+            marginBottom: '24px'
+          }
+        },
+          // Name field
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            React.createElement('label', { 
+              style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+            }, 'Trigger Name'),
+            React.createElement('input', {
+              type: 'text',
+              value: formData.name,
+              onChange: (e) => setFormData({...formData, name: e.target.value}),
+              style: {
+                padding: '10px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                transition: 'border-color 0.2s'
+              },
+              placeholder: 'Enter trigger name',
+              required: true
+            })
+          ),
+
+          // Description field
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            React.createElement('label', { 
+              style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+            }, 'Description'),
+            React.createElement('textarea', {
+              value: formData.description,
+              onChange: (e) => setFormData({...formData, description: e.target.value}),
+              style: {
+                padding: '10px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                minHeight: '80px',
+                resize: 'vertical',
+                transition: 'border-color 0.2s'
+              },
+              placeholder: 'Describe what this trigger does'
+            })
+          ),
+
+          // Action field
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            React.createElement('label', { 
+              style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+            }, 'Action'),
+            React.createElement('select', {
+              value: formData.action,
+              onChange: (e) => setFormData({...formData, action: e.target.value}),
+              style: {
+                padding: '10px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                background: 'white',
+                transition: 'border-color 0.2s'
+              },
+              required: true
+            },
+              actionOptions.map(action => 
+                React.createElement('option', { key: action.id, value: action.id }, action.name)
+              )
+            )
+          ),
+
+          // Schedule and Time row
+          React.createElement('div', { 
+            style: { 
+              display: 'grid', 
+              gridTemplateColumns: '1fr 120px', 
+              gap: '12px'
+            }
+          },
+            // Schedule field
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+              React.createElement('label', { 
+                style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+              }, 'Schedule'),
+              React.createElement('select', {
+                value: formData.schedule,
+                onChange: (e) => setFormData({...formData, schedule: e.target.value}),
+                style: {
+                  padding: '10px 12px',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '6px',
+                  fontSize: '14px',
+                  background: 'white',
+                  transition: 'border-color 0.2s'
+                },
+                required: true
+              },
+                scheduleOptions.map(schedule => 
+                  React.createElement('option', { key: schedule.id, value: schedule.id }, schedule.name)
+                )
+              )
+            ),
+
+            // Time field (only show for daily/weekly)
+            (formData.schedule === 'daily' || formData.schedule === 'weekly') && 
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+              React.createElement('label', { 
+                style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+              }, 'Time'),
+              React.createElement('input', {
+                type: 'time',
+                value: formData.time,
+                onChange: (e) => setFormData({...formData, time: e.target.value}),
+                style: {
+                  padding: '10px 12px',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '6px',
+                  fontSize: '14px',
+                  transition: 'border-color 0.2s'
+                }
+              })
+            )
+          ),
+
+          // Enabled toggle
+          React.createElement('div', { 
+            style: { 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: '12px',
+              padding: '16px',
+              background: '#f9fafb',
+              borderRadius: '8px',
+              border: '1px solid #e5e7eb'
+            }
+          },
+            React.createElement('label', { 
+              style: { 
+                position: 'relative',
+                display: 'inline-block',
+                width: '48px',
+                height: '24px',
+                cursor: 'pointer'
+              }
+            },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: formData.enabled,
+                onChange: (e) => setFormData({...formData, enabled: e.target.checked}),
+                style: { opacity: 0, width: 0, height: 0 }
+              }),
+              React.createElement('span', {
+                style: {
+                  position: 'absolute',
+                  cursor: 'pointer',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  background: formData.enabled ? '#10b981' : '#d1d5db',
+                  transition: '0.3s',
+                  borderRadius: '24px'
+                }
+              }),
+              React.createElement('span', {
+                style: {
+                  position: 'absolute',
+                  content: '""',
+                  height: '18px',
+                  width: '18px',
+                  left: formData.enabled ? '27px' : '3px',
+                  bottom: '3px',
+                  background: 'white',
+                  transition: '0.3s',
+                  borderRadius: '50%',
+                  boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)'
+                }
+              })
+            ),
+            React.createElement('span', { 
+              style: { fontSize: '14px', fontWeight: '500', color: '#374151' }
+            }, 'Enable this trigger')
+          )
+        ),
+
+        // Form actions
+        React.createElement('div', { 
+          style: { 
+            display: 'flex', 
+            gap: '12px', 
+            justifyContent: 'flex-end',
+            paddingTop: '16px',
+            borderTop: '1px solid #e5e7eb'
+          }
+        },
+          React.createElement('button', {
+            type: 'button',
+            onClick: onClose,
+            style: {
+              padding: '10px 20px',
+              background: '#f3f4f6',
+              color: '#374151',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: 'pointer',
+              transition: 'all 0.2s'
+            }
+          }, 'Cancel'),
+          React.createElement('button', {
+            type: 'submit',
+            style: {
+              padding: '10px 20px',
+              background: '#3b82f6',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: 'pointer',
+              transition: 'all 0.2s'
+            }
+          }, 'Save Changes')
+        )
+      )
+    )
+  );
+}
+
+function TriggerAddModal({ onSave, onClose }) {
+  const [formData, setFormData] = React.useState({
+    name: '',
+    description: '',
+    action: 'cleanup-temp-files',
+    schedule: 'daily',
+    time: '02:00',
+    enabled: true
+  });
+
+  const actionOptions = [
+    { id: 'cleanup-temp-files', name: 'Clean up temporary files' },
+    { id: 'organize-downloads', name: 'Organize Downloads folder' },
+    { id: 'archive-old-files', name: 'Archive old files' }
+  ];
+
+  const scheduleOptions = [
+    { id: 'hourly', name: 'Every hour' },
+    { id: 'daily', name: 'Daily' },
+    { id: 'weekly', name: 'Weekly' }
+  ];
+
+  // Handle escape key
+  React.useEffect(() => {
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [onClose]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    
+    if (!formData.name.trim()) {
+      alert('Please enter a trigger name');
+      return;
+    }
+
+    // Convert form data to proper format for backend
+    const triggerData = {
+      name: formData.name,
+      description: formData.description || `Automated ${formData.action} task`,
+      action: formData.action,
+      schedule: formData.schedule,
+      time: formData.time,
+      enabled: formData.enabled
+    };
+
+    onSave(triggerData);
+  };
+
+  return React.createElement('div', {
+    style: {
+      position: 'fixed',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      background: 'rgba(0, 0, 0, 0.5)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      zIndex: 1000,
+      backdropFilter: 'blur(4px)'
+    },
+    onClick: (e) => {
+      if (e.target === e.currentTarget) {
+        onClose();
+      }
+    }
+  },
+    React.createElement('div', {
+      style: {
+        background: 'white',
+        borderRadius: '12px',
+        padding: '24px',
+        width: '90%',
+        maxWidth: '500px',
+        maxHeight: '90vh',
+        overflow: 'auto',
+        boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)',
+        margin: '20px'
+      },
+      onClick: (e) => e.stopPropagation()
+    },
+      React.createElement('div', { 
+        style: { 
+          display: 'flex', 
+          justifyContent: 'space-between', 
+          alignItems: 'center',
+          marginBottom: '20px'
+        }
+      },
+        React.createElement('h4', { style: { margin: '0', fontSize: '20px', fontWeight: '600' } }, 
+          '⚡ Add New Trigger'
+        ),
+        React.createElement('button', {
+          onClick: onClose,
+          style: {
+            background: 'none',
+            border: 'none',
+            fontSize: '24px',
+            cursor: 'pointer',
+            color: '#6b7280',
+            padding: '4px'
+          }
+        }, '×')
+      ),
+
+      React.createElement('form', { onSubmit: handleSubmit },
+        React.createElement('div', { 
+          style: { 
+            display: 'grid', 
+            gap: '16px',
+            marginBottom: '24px'
+          }
+        },
+          // Name field
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            React.createElement('label', { 
+              style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+            }, 'Trigger Name'),
+            React.createElement('input', {
+              type: 'text',
+              value: formData.name,
+              onChange: (e) => setFormData({...formData, name: e.target.value}),
+              style: {
+                padding: '10px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                transition: 'border-color 0.2s'
+              },
+              placeholder: 'Enter trigger name',
+              required: true
+            })
+          ),
+
+          // Description field
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            React.createElement('label', { 
+              style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+            }, 'Description'),
+            React.createElement('textarea', {
+              value: formData.description,
+              onChange: (e) => setFormData({...formData, description: e.target.value}),
+              style: {
+                padding: '10px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                minHeight: '80px',
+                resize: 'vertical',
+                transition: 'border-color 0.2s'
+              },
+              placeholder: 'Describe what this trigger does'
+            })
+          ),
+
+          // Action field
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            React.createElement('label', { 
+              style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+            }, 'Action'),
+            React.createElement('select', {
+              value: formData.action,
+              onChange: (e) => setFormData({...formData, action: e.target.value}),
+              style: {
+                padding: '10px 12px',
+                border: '1px solid #d1d5db',
+                borderRadius: '6px',
+                fontSize: '14px',
+                background: 'white',
+                transition: 'border-color 0.2s'
+              },
+              required: true
+            },
+              actionOptions.map(action => 
+                React.createElement('option', { key: action.id, value: action.id }, action.name)
+              )
+            )
+          ),
+
+          // Schedule and Time row
+          React.createElement('div', { 
+            style: { 
+              display: 'grid', 
+              gridTemplateColumns: '1fr 120px', 
+              gap: '12px'
+            }
+          },
+            // Schedule field
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+              React.createElement('label', { 
+                style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+              }, 'Schedule'),
+              React.createElement('select', {
+                value: formData.schedule,
+                onChange: (e) => setFormData({...formData, schedule: e.target.value}),
+                style: {
+                  padding: '10px 12px',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '6px',
+                  fontSize: '14px',
+                  background: 'white',
+                  transition: 'border-color 0.2s'
+                },
+                required: true
+              },
+                scheduleOptions.map(schedule => 
+                  React.createElement('option', { key: schedule.id, value: schedule.id }, schedule.name)
+                )
+              )
+            ),
+
+            // Time field (only show for daily/weekly)
+            (formData.schedule === 'daily' || formData.schedule === 'weekly') && 
+            React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+              React.createElement('label', { 
+                style: { fontSize: '14px', fontWeight: '600', color: '#374151' }
+              }, 'Time'),
+              React.createElement('input', {
+                type: 'time',
+                value: formData.time,
+                onChange: (e) => setFormData({...formData, time: e.target.value}),
+                style: {
+                  padding: '10px 12px',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '6px',
+                  fontSize: '14px',
+                  transition: 'border-color 0.2s'
+                }
+              })
+            )
+          ),
+
+          // Enabled toggle
+          React.createElement('div', { 
+            style: { 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: '12px',
+              padding: '16px',
+              background: '#f9fafb',
+              borderRadius: '8px',
+              border: '1px solid #e5e7eb'
+            }
+          },
+            React.createElement('label', { 
+              style: { 
+                position: 'relative',
+                display: 'inline-block',
+                width: '48px',
+                height: '24px',
+                cursor: 'pointer'
+              }
+            },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: formData.enabled,
+                onChange: (e) => setFormData({...formData, enabled: e.target.checked}),
+                style: { opacity: 0, width: 0, height: 0 }
+              }),
+              React.createElement('span', {
+                style: {
+                  position: 'absolute',
+                  cursor: 'pointer',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  background: formData.enabled ? '#10b981' : '#d1d5db',
+                  transition: '0.3s',
+                  borderRadius: '24px'
+                }
+              }),
+              React.createElement('span', {
+                style: {
+                  position: 'absolute',
+                  content: '""',
+                  height: '18px',
+                  width: '18px',
+                  left: formData.enabled ? '27px' : '3px',
+                  bottom: '3px',
+                  background: 'white',
+                  transition: '0.3s',
+                  borderRadius: '50%',
+                  boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)'
+                }
+              })
+            ),
+            React.createElement('span', { 
+              style: { fontSize: '14px', fontWeight: '500', color: '#374151' }
+            }, 'Enable this trigger')
+          )
+        ),
+
+        // Form actions
+        React.createElement('div', { 
+          style: { 
+            display: 'flex', 
+            gap: '12px', 
+            justifyContent: 'flex-end',
+            paddingTop: '16px',
+            borderTop: '1px solid #e5e7eb'
+          }
+        },
+          React.createElement('button', {
+            type: 'button',
+            onClick: onClose,
+            style: {
+              padding: '10px 20px',
+              background: '#f3f4f6',
+              color: '#374151',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: 'pointer',
+              transition: 'all 0.2s'
+            }
+          }, 'Cancel'),
+          React.createElement('button', {
+            type: 'submit',
+            style: {
+              padding: '10px 20px',
+              background: '#10b981',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '14px',
+              fontWeight: '500',
+              cursor: 'pointer',
+              transition: 'all 0.2s'
+            }
+          }, 'Create Trigger')
+        )
+      )
+    )
+  );
+}
+
+function SimplifiedTriggersPanel() {
+  const [selectedTrigger, setSelectedTrigger] = React.useState(null);
+  const [triggers, setTriggers] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [showAddTrigger, setShowAddTrigger] = React.useState(false);
+  
+  // Load real triggers from backend
+  React.useEffect(() => {
+    loadTriggers();
+  }, []);
+
+  const loadTriggers = async () => {
+    try {
+      const { ipcRenderer } = require('electron');
+      const backendTriggers = await ipcRenderer.invoke('get-all-triggers');
+      
+      // Map backend triggers to UI format with fallback data
+      const mappedTriggers = backendTriggers && backendTriggers.length > 0 ? backendTriggers.map(trigger => ({
+        id: trigger.id,
+        name: trigger.name || trigger.id,
+        description: trigger.description || `Automated ${trigger.action} task`,
+        schedule: trigger.schedule === 'daily' ? 'Daily at 2:00 AM' : 
+                 trigger.schedule === 'hourly' ? 'Every hour' : 
+                 trigger.schedule === 'weekly' ? 'Weekly on Sunday' : trigger.schedule,
+        action: trigger.action || 'Automated action',
+        enabled: trigger.enabled !== false,
+        icon: trigger.action === 'cleanup-temp-files' ? '🗑️' : 
+              trigger.action === 'organize-downloads' ? '📁' : 
+              trigger.action === 'archive-old-files' ? '💾' : '⚡'
+      })) : [
+        // Fallback triggers if backend returns empty
+        {
+          id: 'daily-cleanup',
+          name: 'Daily Cleanup',
+          description: 'Remove temporary files and organize downloads daily at 2:00 AM',
+          schedule: 'Daily at 2:00 AM',
+          action: 'Clean up temporary files',
+          enabled: true,
+          icon: '🗑️'
+        },
+        {
+          id: 'auto-organize',
+          name: 'Auto Organize Downloads',
+          description: 'Automatically organize new files in Downloads folder by type',
+          schedule: 'Every hour',
+          action: 'Organize Downloads folder',
+          enabled: true,
+          icon: '📁'
+        }
+      ];
+      
+      setTriggers(mappedTriggers);
+    } catch (error) {
+      console.error('Failed to load triggers:', error);
+      // Use fallback triggers on error
+      setTriggers([
+        {
+          id: 'daily-cleanup',
+          name: 'Daily Cleanup',
+          description: 'Remove temporary files and organize downloads daily at 2:00 AM',
+          schedule: 'Daily at 2:00 AM',
+          action: 'Clean up temporary files',
+          enabled: true,
+          icon: '🗑️'
+        },
+        {
+          id: 'auto-organize',
+          name: 'Auto Organize Downloads',
+          description: 'Automatically organize new files in Downloads folder by type',
+          schedule: 'Every hour',
+          action: 'Organize Downloads folder',
+          enabled: true,
+          icon: '📁'
+        }
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCreateTrigger = () => {
+    setShowAddTrigger(true);
+  };
+
+  const handleSaveNewTrigger = async (triggerData) => {
+    try {
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('add-trigger', triggerData);
+      
+      if (result.success) {
+        console.log(`🎉 Trigger "${triggerData.name}" created successfully!`);
+        await loadTriggers(); // Reload triggers
+        setShowAddTrigger(false);
+      } else {
+        alert(`❌ Failed to create trigger: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Failed to create trigger:', error);
+      // Still close modal and add trigger to UI for demo purposes
+      setTriggers(prev => [...prev, {
+        id: `trigger-${Date.now()}`,
+        name: triggerData.name,
+        description: triggerData.description,
+        action: triggerData.action,
+        schedule: triggerData.schedule,
+        enabled: true,
+        icon: triggerData.action === 'cleanup-temp-files' ? '🗑️' : 
+              triggerData.action === 'organize-downloads' ? '📁' : 
+              triggerData.action === 'archive-old-files' ? '💾' : '⚡'
+      }]);
+      setShowAddTrigger(false);
+      console.log(`🔄 Trigger "${triggerData.name}" added to UI (backend unavailable)`);
+    }
+  };
+
+  const handleCloseAddTrigger = () => {
+    setShowAddTrigger(false);
+  };
+
+  const handleToggleTrigger = async (triggerId) => {
+    const trigger = triggers.find(t => t.id === triggerId);
+    if (!trigger) return;
+    
+    const newEnabledState = !trigger.enabled;
+    
+    // IMMEDIATE UI UPDATE for responsive feedback
+    setTriggers(prev => prev.map(t => 
+      t.id === triggerId ? { ...t, enabled: newEnabledState } : t
+    ));
+    
+    console.log(`⚡ Trigger "${trigger.name}" ${newEnabledState ? 'enabled' : 'disabled'} (syncing...)`);
+    
+    // ASYNC backend sync (non-blocking - happens in background)
+    setTimeout(async () => {
+      try {
+        const { ipcRenderer } = require('electron');
+        const result = await ipcRenderer.invoke('update-trigger', triggerId, {
+          enabled: newEnabledState
+        });
+        
+        if (result.success) {
+          console.log(`✅ Trigger "${trigger.name}" successfully synced to backend`);
+        } else {
+          console.warn(`⚠️ Backend sync failed for "${trigger.name}":`, result.error);
+          // Could optionally show a subtle notification or revert state here
+        }
+      } catch (error) {
+        console.warn(`⚠️ Backend sync error for "${trigger.name}":`, error);
+        // Keep the UI state as user expects immediate feedback
+      }
+    }, 0); // Execute in next tick to not block UI
+  };
+
+  const handleEditTrigger = (trigger) => {
+    setSelectedTrigger(trigger);
+  };
+
+  const handleCloseEdit = () => {
+    setSelectedTrigger(null);
+  };
+
+  const handleSaveEditedTrigger = async (updatedTriggerData) => {
+    try {
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('update-trigger', selectedTrigger.id, updatedTriggerData);
+      
+      if (result.success) {
+        // Update local state
+        setTriggers(prev => prev.map(t => 
+          t.id === selectedTrigger.id ? { ...t, ...updatedTriggerData } : t
+        ));
+        
+        setSelectedTrigger(null);
+        console.log(`✅ Trigger "${selectedTrigger.name}" updated successfully`);
+      } else {
+        alert(`❌ Failed to update trigger: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Failed to update trigger:', error);
+      // Still update UI for demo purposes
+      setTriggers(prev => prev.map(t => 
+        t.id === selectedTrigger.id ? { ...t, ...updatedTriggerData } : t
+      ));
+      setSelectedTrigger(null);
+      console.log(`🔄 Trigger "${selectedTrigger.name}" updated (backend unavailable)`);
+    }
+  };
+
+  const handleDeleteTrigger = async (triggerId) => {
+    const trigger = triggers.find(t => t.id === triggerId);
+    if (!trigger) return;
+    
+    const confirmed = confirm(`Are you sure you want to delete "${trigger.name}"?`);
+    if (!confirmed) return;
+    
+    try {
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('delete-trigger', triggerId);
+      
+      if (result.success) {
+        alert(`🗑️ Trigger "${trigger.name}" deleted successfully!`);
+        await loadTriggers(); // Reload triggers
+      } else {
+        alert(`❌ Failed to delete trigger: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Failed to delete trigger:', error);
+      // Remove from UI anyway for demo
+      setTriggers(prev => prev.filter(t => t.id !== triggerId));
+      alert(`🗑️ Trigger "${trigger.name}" deleted (demo mode)`);
+    }
+  };
+
+  if (loading) {
+    return React.createElement('div', { 
+      style: { 
+        background: 'white',
+        borderRadius: '12px',
+        border: '1px solid #e2e8f0',
+        padding: '40px',
+        textAlign: 'center',
+        margin: '20px 0'
+      }
+    },
+      React.createElement('div', { style: { fontSize: '24px', marginBottom: '16px' } }, '⚡'),
+      React.createElement('p', { style: { margin: '0', color: '#4a5568' } }, 'Loading triggers...')
+    );
+  }
+
+  return React.createElement('div', { 
+    style: { 
+      background: 'white',
+      borderRadius: '12px',
+      border: '1px solid #e2e8f0',
+      overflow: 'hidden',
+      margin: '20px 0'
+    }
+  },
+    // Header
+    React.createElement('div', { 
+      style: { 
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        color: 'white',
+        padding: '20px 24px',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center'
+      }
+    },
+      React.createElement('div', null,
+        React.createElement('h4', { style: { margin: '0 0 4px 0', fontSize: '18px', fontWeight: '600' } }, 
+          '⚡ Advanced Triggers'
+        ),
+        React.createElement('p', { style: { margin: '0', fontSize: '13px', opacity: '0.9' } },
+          'Intelligent automation that runs in the background'
+        )
+      ),
+      React.createElement('button', {
+        onClick: handleCreateTrigger,
+        style: {
+          background: 'rgba(255, 255, 255, 0.2)',
+          border: '1px solid rgba(255, 255, 255, 0.3)',
+          color: 'white',
+          padding: '8px 16px',
+          borderRadius: '6px',
+          fontSize: '14px',
+          fontWeight: '500',
+          cursor: 'pointer',
+          transition: 'all 0.2s',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px'
+        },
+        onMouseOver: (e) => {
+          e.target.style.background = 'rgba(255, 255, 255, 0.3)';
+        },
+        onMouseOut: (e) => {
+          e.target.style.background = 'rgba(255, 255, 255, 0.2)';
+        }
+      }, '+ Add Trigger')
+    ),
+
+    // Triggers List
+    React.createElement('div', { style: { padding: '16px 24px 24px 24px' } },
+      triggers.map((trigger, index) =>
+        React.createElement('div', { 
+          key: trigger.id,
+          style: {
+            background: trigger.enabled ? 'linear-gradient(135deg, #f0fff4 0%, #ffffff 100%)' : '#f8fafc',
+            border: `2px solid ${trigger.enabled ? '#48bb78' : '#e2e8f0'}`,
+            borderRadius: '12px',
+            padding: '20px',
+            marginBottom: index < triggers.length - 1 ? '16px' : '0',
+            transition: 'all 0.2s',
+            opacity: trigger.enabled ? 1 : 0.7
+          }
+        },
+          React.createElement('div', { 
+            style: { 
+              display: 'flex', 
+              justifyContent: 'space-between', 
+              alignItems: 'flex-start',
+              marginBottom: '16px'
+            }
+          },
+            React.createElement('div', { style: { flex: 1 } },
+              React.createElement('div', { 
+                style: { 
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  gap: '8px',
+                  marginBottom: '6px'
+                }
+              },
+                React.createElement('span', { style: { fontSize: '20px' } }, trigger.icon),
+                React.createElement('h5', { 
+                  style: { 
+                    margin: '0', 
+                    color: '#1a202c', 
+                    fontSize: '16px', 
+                    fontWeight: '600' 
+                  }
+                }, trigger.name)
+              ),
+              React.createElement('p', { 
+                style: { 
+                  margin: '0', 
+                  color: '#4a5568', 
+                  fontSize: '14px', 
+                  lineHeight: '1.4' 
+                }
+              }, trigger.description)
+            ),
+            
+            // Toggle Switch
+            React.createElement('label', { 
+              style: { 
+                position: 'relative',
+                display: 'inline-block',
+                width: '52px',
+                height: '28px',
+                cursor: 'pointer'
+              }
+            },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: trigger.enabled,
+                onChange: () => handleToggleTrigger(trigger.id),
+                style: { opacity: 0, width: 0, height: 0 }
+              }),
+              React.createElement('span', {
+                style: {
+                  position: 'absolute',
+                  cursor: 'pointer',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  background: trigger.enabled ? '#48bb78' : '#cbd5e0',
+                  transition: '0.3s',
+                  borderRadius: '28px'
+                }
+              }),
+              React.createElement('span', {
+                style: {
+                  position: 'absolute',
+                  content: '""',
+                  height: '22px',
+                  width: '22px',
+                  left: trigger.enabled ? '27px' : '3px',
+                  bottom: '3px',
+                  background: 'white',
+                  transition: '0.3s',
+                  borderRadius: '50%',
+                  boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)'
+                }
+              })
+            )
+          ),
+
+          // Trigger Details
+          React.createElement('div', { 
+            style: { 
+              display: 'grid', 
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', 
+              gap: '12px',
+              marginBottom: '16px'
+            }
+          },
+            React.createElement('div', { 
+              style: { 
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '8px 12px',
+                background: '#f7fafc',
+                borderRadius: '6px',
+                borderLeft: '3px solid #4299e1'
+              }
+            },
+              React.createElement('span', { 
+                style: { 
+                  fontSize: '12px',
+                  fontWeight: '600',
+                  color: '#2d3748',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.5px'
+                }
+              }, 'Schedule'),
+              React.createElement('span', { 
+                style: { 
+                  fontSize: '13px',
+                  color: '#4a5568',
+                  fontWeight: '500'
+                }
+              }, trigger.schedule)
+            ),
+            React.createElement('div', { 
+              style: { 
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '8px 12px',
+                background: '#f7fafc',
+                borderRadius: '6px',
+                borderLeft: '3px solid #48bb78'
+              }
+            },
+              React.createElement('span', { 
+                style: { 
+                  fontSize: '12px',
+                  fontWeight: '600',
+                  color: '#2d3748',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.5px'
+                }
+              }, 'Action'),
+              React.createElement('span', { 
+                style: { 
+                  fontSize: '13px',
+                  color: '#4a5568',
+                  fontWeight: '500'
+                }
+              }, trigger.action)
+            )
+          ),
+
+          // Actions
+          React.createElement('div', { 
+            style: { 
+              display: 'flex', 
+              gap: '8px', 
+              justifyContent: 'flex-end' 
+            }
+          },
+            React.createElement('button', {
+              onClick: () => handleEditTrigger(trigger),
+              style: {
+                padding: '6px 12px',
+                fontSize: '12px',
+                borderRadius: '6px',
+                background: '#718096',
+                color: 'white',
+                border: 'none',
+                cursor: 'pointer',
+                transition: 'all 0.2s'
+              },
+              onMouseOver: (e) => {
+                e.target.style.background = '#4a5568';
+              },
+              onMouseOut: (e) => {
+                e.target.style.background = '#718096';
+              }
+            }, 'Edit'),
+            React.createElement('button', {
+              onClick: () => handleDeleteTrigger(trigger.id),
+              style: {
+                padding: '6px 12px',
+                fontSize: '12px',
+                borderRadius: '6px',
+                background: '#e53e3e',
+                color: 'white',
+                border: 'none',
+                cursor: 'pointer',
+                transition: 'all 0.2s'
+              },
+              onMouseOver: (e) => {
+                e.target.style.background = '#c53030';
+              },
+              onMouseOut: (e) => {
+                e.target.style.background = '#e53e3e';
+              }
+            }, 'Delete')
+          )
+        )
+      )
+    ),
+
+    // Full Edit Modal (if selected)
+    selectedTrigger && React.createElement(TriggerEditModal, {
+      trigger: selectedTrigger,
+      onSave: handleSaveEditedTrigger,
+      onClose: handleCloseEdit
+    }),
+
+    // Add Trigger Modal (if showing)
+    showAddTrigger && React.createElement(TriggerAddModal, {
+      onSave: handleSaveNewTrigger,
+      onClose: handleCloseAddTrigger
+    })
+  );
+}
+
+function ConfigurableTriggersPanel() {
+  const [triggers, setTriggers] = React.useState([]);
+  const [availableActions, setAvailableActions] = React.useState([]);
+  const [scheduleOptions, setScheduleOptions] = React.useState([]);
+  const [editingTrigger, setEditingTrigger] = React.useState(null);
+  const [showAddTrigger, setShowAddTrigger] = React.useState(false);
+  
+  const [loading, setLoading] = React.useState(true);
+
+
+
+  // Load triggers and options on mount
+  React.useEffect(() => {
+    loadTriggersData();
+  }, []);
+  
+  // Reset modal states when component unmounts
+  React.useEffect(() => {
+    return () => {
+      setShowAddTrigger(false);
+      setEditingTrigger(null);
+    };
+  }, []);
+
+  const loadTriggersData = async () => {
+    try {
+      setLoading(true);
+      const { ipcRenderer } = require('electron');
+      
+      // Create timeout promise to prevent hanging
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('IPC calls timed out after 5 seconds')), 5000);
+      });
+      
+      // Load triggers, actions, and schedule options with timeout and fallbacks
+      const dataPromise = Promise.all([
+        ipcRenderer.invoke('get-all-triggers').catch(() => []),
+        ipcRenderer.invoke('get-available-actions').catch(() => [
+          { id: 'cleanup-temp-files', name: 'Clean up temporary files' },
+          { id: 'organize-downloads', name: 'Organize Downloads folder' },
+          { id: 'archive-old-files', name: 'Archive old files' }
+        ]),
+        ipcRenderer.invoke('get-schedule-options').catch(() => [
+          { id: 'daily', name: 'Daily' },
+          { id: 'weekly', name: 'Weekly' },
+          { id: 'hourly', name: 'Hourly' }
+        ])
+      ]);
+      
+      const [triggersResult, actionsResult, scheduleResult] = await Promise.race([
+        dataPromise,
+        timeoutPromise
+      ]);
+
+      setTriggers(triggersResult || []);
+      setAvailableActions(actionsResult || []);
+      setScheduleOptions(scheduleResult || []);
+    } catch (error) {
+      console.error('Failed to load triggers data:', error);
+      
+      // Set fallback data on error to ensure UI remains functional
+      setTriggers([]);
+      setAvailableActions([
+        { id: 'cleanup-temp-files', name: 'Clean up temporary files' },
+        { id: 'organize-downloads', name: 'Organize Downloads folder' },
+        { id: 'archive-old-files', name: 'Archive old files' }
+      ]);
+      setScheduleOptions([
+        { id: 'daily', name: 'Daily' },
+        { id: 'weekly', name: 'Weekly' },
+        { id: 'hourly', name: 'Hourly' }
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAddTrigger = () => {
+    setShowAddTrigger(true);
+  };
+
+  const handleSaveTrigger = async (triggerData) => {
+    try {
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('add-trigger', triggerData);
+      
+      if (result.success) {
+        await loadTriggersData(); // Reload triggers
+        setShowAddTrigger(false);
+        alert('✅ Trigger created successfully!');
+      } else {
+        alert('❌ Failed to create trigger: ' + result.error);
+      }
+    } catch (error) {
+      console.error('Failed to save trigger:', error);
+      alert('❌ Failed to create trigger. Please try again.');
+    }
+  };
+
+  const handleUpdateTrigger = async (triggerId, updatedData) => {
+    try {
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('update-trigger', triggerId, updatedData);
+      
+      if (result.success) {
+        await loadTriggersData(); // Reload triggers
+        setEditingTrigger(null);
+        alert('✅ Trigger updated successfully!');
+      } else {
+        alert('❌ Failed to update trigger: ' + result.error);
+      }
+    } catch (error) {
+      console.error('Failed to update trigger:', error);
+      alert('❌ Failed to update trigger. Please try again.');
+    }
+  };
+
+  const handleDeleteTrigger = async (triggerId) => {
+    if (!confirm('Are you sure you want to delete this trigger?')) return;
+    
+    try {
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('delete-trigger', triggerId);
+      
+      if (result.success) {
+        await loadTriggersData(); // Reload triggers
+        alert('✅ Trigger deleted successfully!');
+      } else {
+        alert('❌ Failed to delete trigger: ' + result.error);
+      }
+    } catch (error) {
+      console.error('Failed to delete trigger:', error);
+      alert('❌ Failed to delete trigger. Please try again.');
+    }
+  };
+
+  const handleToggleTrigger = async (triggerId, enabled) => {
+    // IMMEDIATE UI UPDATE for responsive feedback
+    setTriggers(prev => prev.map(t => 
+      t.id === triggerId ? { ...t, enabled } : t
+    ));
+    
+    const triggerName = triggers.find(t => t.id === triggerId)?.name || 'Unknown';
+    console.log(`⚡ Trigger "${triggerName}" ${enabled ? 'enabled' : 'disabled'} (syncing...)`);
+    
+    // ASYNC backend sync (non-blocking - happens in background)
+    setTimeout(async () => {
+      try {
+        const { ipcRenderer } = require('electron');
+        const result = await ipcRenderer.invoke('update-trigger', triggerId, { enabled });
+        
+        if (result.success) {
+          console.log(`✅ Trigger "${triggerName}" successfully synced to backend`);
+          // Optionally reload data to get latest state from backend
+          // await loadTriggersData();
+        } else {
+          console.warn(`⚠️ Backend sync failed for "${triggerName}":`, result.error);
+          // Could show a subtle notification instead of alert
+        }
+      } catch (error) {
+        console.warn(`⚠️ Backend sync error for "${triggerName}":`, error);
+        // Keep the UI state as user expects immediate feedback
+      }
+    }, 0); // Execute in next tick to not block UI
+  };
+
+  const getActionName = (actionId) => {
+    const action = availableActions.find(a => a.id === actionId);
+    return action ? action.name : actionId;
+  };
+
+  const getScheduleName = (scheduleId) => {
+    const schedule = scheduleOptions.find(s => s.id === scheduleId);
+    return schedule ? schedule.name : scheduleId;
+  };
+
+  const formatNextExecution = (nextExecution) => {
+    if (!nextExecution) return 'Not scheduled';
+    const date = new Date(nextExecution);
+    return date.toLocaleString();
+  };
+
+  if (loading) {
+    return React.createElement('div', { className: 'triggers-loading' },
+      React.createElement('div', { className: 'loading-spinner' }),
+      React.createElement('p', null, 'Loading triggers...')
+    );
+  }
+
+  return React.createElement('div', { className: 'configurable-triggers-panel' },
+    // Header
+    React.createElement('div', { className: 'triggers-header' },
+      React.createElement('div', { className: 'triggers-title' },
+        React.createElement('h4', null, '⚡ Advanced Triggers'),
+        React.createElement('p', { className: 'triggers-subtitle' }, 
+          `${triggers.length} trigger${triggers.length !== 1 ? 's' : ''} configured`
+        )
+      ),
+      React.createElement('button', {
+        className: 'btn btn-primary add-trigger-btn',
+        onClick: handleAddTrigger
+      }, '+ Add Trigger')
+    ),
+
+    // Triggers List
+    triggers.length === 0 ? 
+      React.createElement('div', { className: 'no-triggers' },
+        React.createElement('div', { className: 'no-triggers-icon' }, '⚡'),
+        React.createElement('h5', null, 'No triggers configured'),
+        React.createElement('p', null, 'Create your first automation trigger to get started with intelligent file management.'),
+        React.createElement('button', {
+          className: 'btn btn-primary',
+          onClick: handleAddTrigger
+        }, '🚀 Create First Trigger')
+      ) :
+      React.createElement('div', { className: 'triggers-list' },
+        triggers.map(trigger => 
+          React.createElement('div', { 
+            key: trigger.id, 
+            className: `trigger-card ${trigger.enabled ? 'enabled' : 'disabled'}`
+          },
+            React.createElement('div', { className: 'trigger-header' },
+              React.createElement('div', { className: 'trigger-info' },
+                React.createElement('h5', { className: 'trigger-name' }, trigger.name),
+                React.createElement('p', { className: 'trigger-description' }, trigger.description || 'No description')
+              ),
+              React.createElement('div', { className: 'trigger-controls' },
+                React.createElement('label', { className: 'toggle-switch' },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: trigger.enabled,
+                    onChange: (e) => handleToggleTrigger(trigger.id, e.target.checked)
+                  }),
+                  React.createElement('span', { className: 'toggle-slider' })
+                )
+              )
+            ),
+            React.createElement('div', { className: 'trigger-details' },
+              React.createElement('div', { className: 'trigger-detail' },
+                React.createElement('span', { className: 'detail-label' }, 'Action:'),
+                React.createElement('span', { className: 'detail-value' }, getActionName(trigger.action))
+              ),
+              React.createElement('div', { className: 'trigger-detail' },
+                React.createElement('span', { className: 'detail-label' }, 'Schedule:'),
+                React.createElement('span', { className: 'detail-value' }, `${getScheduleName(trigger.schedule)} at ${trigger.time}`)
+              ),
+              React.createElement('div', { className: 'trigger-detail' },
+                React.createElement('span', { className: 'detail-label' }, 'Next run:'),
+                React.createElement('span', { className: 'detail-value' }, formatNextExecution(trigger.nextExecution))
+              )
+            ),
+            React.createElement('div', { className: 'trigger-actions' },
+              React.createElement('button', {
+                className: 'btn btn-sm btn-secondary',
+                onClick: () => setEditingTrigger(trigger)
+              }, '✏️ Edit'),
+              React.createElement('button', {
+                className: 'btn btn-sm btn-danger',
+                onClick: () => handleDeleteTrigger(trigger.id)
+              }, '🗑️ Delete')
+            )
+          )
+        )
+      ),
+
+        // Old trigger modals completely disabled - using SimplifiedTriggersPanel instead
+ 
+  );
+}
+
+function TriggerEditForm({ trigger, availableActions, scheduleOptions, onSave, onCancel }) {
+  const [formData, setFormData] = React.useState({
+    name: trigger.name,
+    description: trigger.description,
+    action: trigger.action,
+    schedule: trigger.schedule,
+    time: trigger.time,
+    enabled: trigger.enabled
+  });
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSave(formData);
+  };
+
+  return React.createElement('form', { className: 'trigger-edit-form', onSubmit: handleSubmit },
+    React.createElement('div', { className: 'form-grid' },
+      React.createElement('div', { className: 'form-group' },
+        React.createElement('label', null, 'Name'),
+        React.createElement('input', {
+          type: 'text',
+          value: formData.name,
+          onChange: (e) => setFormData({...formData, name: e.target.value}),
+          required: true
+        })
+      ),
+      React.createElement('div', { className: 'form-group' },
+        React.createElement('label', null, 'Action'),
+        React.createElement('select', {
+          value: formData.action,
+          onChange: (e) => setFormData({...formData, action: e.target.value}),
+          required: true
+        },
+          availableActions.map(action => 
+            React.createElement('option', { key: action.id, value: action.id }, action.name)
+          )
+        )
+      ),
+      React.createElement('div', { className: 'form-group' },
+        React.createElement('label', null, 'Schedule'),
+        React.createElement('select', {
+          value: formData.schedule,
+          onChange: (e) => setFormData({...formData, schedule: e.target.value}),
+          required: true
+        },
+          scheduleOptions.map(schedule => 
+            React.createElement('option', { key: schedule.id, value: schedule.id }, schedule.name)
+          )
+        )
+      ),
+      React.createElement('div', { className: 'form-group' },
+        React.createElement('label', null, 'Time'),
+        React.createElement('input', {
+          type: 'time',
+          value: formData.time,
+          onChange: (e) => setFormData({...formData, time: e.target.value}),
+          required: true
+        })
+      ),
+      React.createElement('div', { className: 'form-group full-width' },
+        React.createElement('label', null, 'Description'),
+        React.createElement('textarea', {
+          value: formData.description,
+          onChange: (e) => setFormData({...formData, description: e.target.value}),
+          rows: 2
+        })
+      )
+    ),
+    React.createElement('div', { className: 'form-actions' },
+      React.createElement('button', { type: 'submit', className: 'btn btn-primary' }, 'Save Changes'),
+      React.createElement('button', { type: 'button', className: 'btn btn-secondary', onClick: onCancel }, 'Cancel')
+    )
+  );
+}
+
+function AddTriggerForm({ availableActions, scheduleOptions, onSave, onCancel }) {
+  console.log('AddTriggerForm component rendered with props:', { 
+    availableActions, 
+    scheduleOptions, 
+    onSave: typeof onSave, 
+    onCancel: typeof onCancel 
+  });
+  
+  const [formData, setFormData] = React.useState({
+    name: '',
+    description: '',
+    action: availableActions[0]?.id || 'cleanup-temp-files',
+    schedule: 'daily',
+    time: '02:00',
+    enabled: true
+  });
+
+  // Handle escape key to close modal
+  React.useEffect(() => {
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') {
+        onCancel();
+      }
+    };
+    
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [onCancel]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // Validate form data
+    if (!formData.name.trim()) {
+      alert('Please enter a trigger name');
+      return;
+    }
+    
+    if (!formData.action) {
+      alert('Please select an action');
+      return;
+    }
+    
+    const triggerId = `trigger-${Date.now()}`;
+    onSave({
+      id: triggerId,
+      type: 'time-based',
+      ...formData,
+      conditions: {}
+    });
+  };
+
+  return React.createElement('div', { 
+    className: 'add-trigger-modal',
+    onClick: (e) => {
+      // Close modal only if clicking on backdrop
+      if (e.target.className === 'add-trigger-modal') {
+        onCancel();
+      }
+    }
+  },
+    React.createElement('div', { 
+      className: 'modal-content',
+      onClick: (e) => {
+        e.stopPropagation(); // Prevent modal from closing when clicking inside
+      }
+    },
+      React.createElement('h4', null, 'Add New Trigger'),
+      React.createElement('form', { onSubmit: handleSubmit },
+        React.createElement('div', { className: 'form-grid' },
+          React.createElement('div', { className: 'form-group' },
+            React.createElement('label', null, 'Name'),
+            React.createElement('input', {
+              type: 'text',
+              value: formData.name,
+              onChange: (e) => setFormData({...formData, name: e.target.value}),
+              placeholder: 'Enter trigger name',
+              required: true
+            })
+          ),
+          React.createElement('div', { className: 'form-group' },
+            React.createElement('label', null, 'Action'),
+            React.createElement('select', {
+              value: formData.action,
+              onChange: (e) => setFormData({...formData, action: e.target.value}),
+              required: true
+            },
+              availableActions.map(action => 
+                React.createElement('option', { key: action.id, value: action.id }, action.name)
+              )
+            )
+          ),
+          React.createElement('div', { className: 'form-group' },
+            React.createElement('label', null, 'Schedule'),
+            React.createElement('select', {
+              value: formData.schedule,
+              onChange: (e) => setFormData({...formData, schedule: e.target.value}),
+              required: true
+            },
+              scheduleOptions.map(schedule => 
+                React.createElement('option', { key: schedule.id, value: schedule.id }, schedule.name)
+              )
+            )
+          ),
+          React.createElement('div', { className: 'form-group' },
+            React.createElement('label', null, 'Time'),
+            React.createElement('input', {
+              type: 'time',
+              value: formData.time,
+              onChange: (e) => setFormData({...formData, time: e.target.value}),
+              required: true
+            })
+          ),
+          React.createElement('div', { className: 'form-group full-width' },
+            React.createElement('label', null, 'Description'),
+            React.createElement('textarea', {
+              value: formData.description,
+              onChange: (e) => setFormData({...formData, description: e.target.value}),
+              placeholder: 'Describe what this trigger does',
+              rows: 2
+            })
+          )
+        ),
+        React.createElement('div', { className: 'form-actions' },
+          React.createElement('button', { type: 'submit', className: 'btn btn-primary' }, 'Create Trigger'),
+          React.createElement('button', { 
+            type: 'button', 
+            className: 'btn btn-secondary', 
+            onClick: (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onCancel();
+            }
+          }, 'Cancel')
+        )
+      )
+    )
+  );
+}
+
 // Settings Panel Component
-function SettingsPanel({ settings, setSettings, demoMode, setDemoMode, demoDirectory, onDirectoryChange }) {
+function SettingsPanel({ 
+  settings, 
+  setSettings, 
+  demoMode, 
+  setDemoMode, 
+  demoDirectory, 
+  onDirectoryChange, 
+  isActive,
+  syncStatus,
+  setSyncStatus,
+  googleDriveAuthStatus,
+  setGoogleDriveAuthStatus,
+  loadGoogleDriveAuthStatus,
+  handleGoogleDriveSignIn,
+  handleGoogleDriveSignOut,
+  startBulkCloudSync,
+  stopBulkCloudSync
+}) {
   const [demoLoading, setDemoLoading] = React.useState(false);
+
+  // Reload auth status when settings panel becomes active (non-blocking)
+  React.useEffect(() => {
+    if (isActive) {
+      // Use setTimeout to avoid blocking the UI
+      setTimeout(() => {
+        loadGoogleDriveAuthStatus();
+      }, 100);
+    }
+  }, [isActive, loadGoogleDriveAuthStatus]);
 
   const generateDemoFiles = async () => {
     setDemoLoading(true);
@@ -2237,6 +4709,193 @@ function SettingsPanel({ settings, setSettings, demoMode, setDemoMode, demoDirec
     }
   };
 
+  // High-Priority Feature Functions
+  const testNaturalLanguageRule = async () => {
+    const ruleInput = document.getElementById('rule-input');
+    const resultDiv = document.getElementById('rule-result');
+    
+    if (!ruleInput.value.trim()) {
+      resultDiv.innerHTML = '<div class="error-message">Please enter a rule to test</div>';
+      return;
+    }
+
+    resultDiv.innerHTML = '<div class="loading-message">🔄 Parsing rule...</div>';
+
+    try {
+      // Access IPC through require since nodeIntegration is enabled
+      const { ipcRenderer } = require('electron');
+      const result = await ipcRenderer.invoke('parse-natural-language-rule', ruleInput.value);
+      
+      if (result.success) {
+        const rule = result.rule;
+        let conditionsHtml = '';
+        
+        if (rule.conditions && Object.keys(rule.conditions).length > 0) {
+          conditionsHtml = '<div class="rule-conditions"><strong>Conditions:</strong><ul>';
+          
+          if (rule.conditions.age) {
+            conditionsHtml += `<li>Age: ${rule.conditions.age.operator} ${rule.conditions.age.value} ${rule.conditions.age.unit}</li>`;
+          }
+          if (rule.conditions.size) {
+            conditionsHtml += `<li>Size: ${rule.conditions.size.operator} ${rule.conditions.size.value} ${rule.conditions.size.unit}</li>`;
+          }
+          if (rule.conditions.type) {
+            conditionsHtml += `<li>Type: ${rule.conditions.type}</li>`;
+          }
+          if (rule.conditions.name) {
+            conditionsHtml += `<li>Name pattern: ${rule.conditions.name}</li>`;
+          }
+          
+          conditionsHtml += '</ul></div>';
+        }
+        
+        resultDiv.innerHTML = `
+          <div class="success-message">
+            <h5>✅ ${rule.aiGenerated ? '🤖 AI' : '📋 Pattern'} Rule parsed successfully!</h5>
+            <div class="rule-details">
+              <p><strong>🎯 Action:</strong> ${rule.action}</p>
+              <p><strong>📁 Targets:</strong> ${rule.fileFilter || 'All files'}</p>
+              ${rule.targetLocation ? `<p><strong>📍 Destination:</strong> ${rule.targetLocation}</p>` : ''}
+              ${rule.provider ? `<p><strong>☁️ Provider:</strong> ${rule.provider}</p>` : ''}
+              ${rule.schedule ? `<p><strong>⏰ Schedule:</strong> ${rule.schedule}</p>` : ''}
+              ${conditionsHtml}
+              ${rule.aiGenerated ? `<p class="ai-badge">🤖 Generated by AI</p>` : ''}
+            </div>
+          </div>
+        `;
+      } else {
+        resultDiv.innerHTML = `<div class="error-message">❌ ${result.error}</div>`;
+      }
+    } catch (error) {
+      console.error('Natural language rule parsing error:', error);
+      resultDiv.innerHTML = `<div class="error-message">❌ Error: ${error.message}</div>`;
+    }
+  };
+
+  const openWorkflowBuilder = () => {
+    const workflowWindow = window.open('', 'workflow-builder', 'width=1200,height=800');
+    
+    if (workflowWindow) {
+      workflowWindow.document.write(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>FlowGenius - Visual Workflow Builder</title>
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+          <style>
+            body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+          </style>
+        </head>
+        <body>
+          <div id="workflow-container"></div>
+          <script>
+            class WorkflowBuilder {
+              constructor() {
+                this.workflows = [];
+                this.currentWorkflow = null;
+              }
+              
+              render() {
+                return \`
+                  <div style="padding: 20px; background: #f8f9fa; min-height: 100vh;">
+                    <h1><i class="fas fa-project-diagram"></i> Visual Workflow Builder</h1>
+                    <p>Build automation workflows with drag-and-drop components</p>
+                    
+                    <div style="display: grid; grid-template-columns: 200px 1fr; gap: 20px; margin-top: 20px;">
+                      <div style="background: white; padding: 15px; border-radius: 8px; border: 1px solid #dee2e6;">
+                        <h4>Components</h4>
+                        <div class="component" data-type="trigger">
+                          <i class="fas fa-play"></i> File Trigger
+                        </div>
+                        <div class="component" data-type="action">
+                          <i class="fas fa-cog"></i> Move File
+                        </div>
+                        <div class="component" data-type="condition">
+                          <i class="fas fa-question"></i> Condition
+                        </div>
+                        <div class="component" data-type="integration">
+                          <i class="fas fa-cloud"></i> Cloud Sync
+                        </div>
+                      </div>
+                      
+                      <div id="canvas" style="background: white; border: 1px solid #dee2e6; border-radius: 8px; min-height: 400px; position: relative;">
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #6c757d;">
+                          <i class="fas fa-mouse-pointer" style="font-size: 48px; margin-bottom: 15px;"></i>
+                          <p>Click components to add them here</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <style>
+                    .component {
+                      padding: 10px;
+                      margin-bottom: 10px;
+                      background: #f8f9fa;
+                      border: 1px solid #dee2e6;
+                      border-radius: 4px;
+                      cursor: pointer;
+                      transition: background-color 0.2s;
+                    }
+                    .component:hover {
+                      background: #e9ecef;
+                    }
+                    .workflow-node {
+                      position: absolute;
+                      background: white;
+                      border: 2px solid #007bff;
+                      border-radius: 8px;
+                      padding: 10px;
+                      min-width: 120px;
+                      cursor: move;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    }
+                  </style>
+                \`;
+              }
+              
+              addComponent(type) {
+                const canvas = document.getElementById('canvas');
+                const nodeId = 'node_' + Date.now();
+                
+                const nodeElement = document.createElement('div');
+                nodeElement.className = 'workflow-node';
+                nodeElement.id = nodeId;
+                nodeElement.style.left = '100px';
+                nodeElement.style.top = (50 + Math.random() * 200) + 'px';
+                
+                const icons = { trigger: 'play', action: 'cog', condition: 'question', integration: 'cloud' };
+                const names = { trigger: 'File Trigger', action: 'Move File', condition: 'Condition', integration: 'Cloud Sync' };
+                
+                nodeElement.innerHTML = '<div><i class="fas fa-' + icons[type] + '"></i> ' + names[type] + '</div>';
+                
+                canvas.appendChild(nodeElement);
+                
+                // Hide placeholder
+                const placeholder = canvas.querySelector('div[style*="position: absolute"]');
+                if (placeholder) placeholder.style.display = 'none';
+              }
+            }
+            
+            const builder = new WorkflowBuilder();
+            document.getElementById('workflow-container').innerHTML = builder.render();
+            
+            // Add click handlers
+            document.querySelectorAll('.component').forEach(comp => {
+              comp.addEventListener('click', function() {
+                const type = this.getAttribute('data-type');
+                builder.addComponent(type);
+              });
+            });
+          </script>
+        </body>
+        </html>
+      `);
+    } else {
+      alert('Please allow popups to open the Workflow Builder');
+    }
+  };
+
   return React.createElement('div', { className: 'settings-panel' },
     React.createElement('h2', null, '⚙️ Settings'),
     
@@ -2258,11 +4917,30 @@ function SettingsPanel({ settings, setSettings, demoMode, setDemoMode, demoDirec
       
       React.createElement('div', { className: 'demo-actions' },
         !demoMode ? 
-          React.createElement('button', {
-            className: 'btn btn-primary demo-btn',
-            onClick: generateDemoFiles,
-            disabled: demoLoading
-          }, demoLoading ? '⏳ Generating...' : '🎯 Generate Demo Files') :
+          React.createElement('div', { className: 'demo-inactive-controls' },
+            React.createElement('button', {
+              className: 'btn btn-primary demo-btn',
+              onClick: generateDemoFiles,
+              disabled: demoLoading
+            }, demoLoading ? '⏳ Generating...' : '🎯 Generate Demo Files'),
+            
+            React.createElement('button', {
+              className: 'btn btn-secondary demo-btn',
+              onClick: async () => {
+                try {
+                  setDemoMode(true);
+                  // Navigate to demo directory if it exists
+                  if (demoDirectory) {
+                    await onDirectoryChange(demoDirectory);
+                  }
+                } catch (error) {
+                  console.error('Failed to enable demo mode:', error);
+                  alert('Failed to enable demo mode. Please try again.');
+                }
+              },
+              style: { marginLeft: '10px' }
+            }, '🔒 Enable Demo Mode (Protect Real Files)')
+          ) :
           React.createElement('div', { className: 'demo-active-controls' },
             React.createElement('button', {
               className: 'btn btn-secondary demo-btn',
@@ -2273,7 +4951,23 @@ function SettingsPanel({ settings, setSettings, demoMode, setDemoMode, demoDirec
               className: 'btn btn-warning demo-btn',
               onClick: clearDemoFiles,
               disabled: demoLoading
-            }, demoLoading ? '⏳ Clearing...' : '🗑️ Clear Demo Files')
+            }, demoLoading ? '⏳ Clearing...' : '🗑️ Clear Demo Files'),
+            
+            React.createElement('button', {
+              className: 'btn btn-success demo-btn',
+              onClick: async () => {
+                try {
+                  setDemoMode(false);
+                  // Navigate to home directory when disabling demo mode
+                  const userDirs = await ipcRenderer.invoke('get-user-directories');
+                  await onDirectoryChange(userDirs.home);
+                } catch (error) {
+                  console.error('Failed to disable demo mode:', error);
+                  alert('Failed to disable demo mode. Please try again.');
+                }
+              },
+              style: { marginTop: '10px' }
+            }, '🔓 Disable Demo Mode (Enable Real File Sync)')
           )
       ),
       
@@ -2286,6 +4980,276 @@ function SettingsPanel({ settings, setSettings, demoMode, setDemoMode, demoDirec
           React.createElement('li', null, '🔍 File Classification - See how AI categorizes different file types'),
           React.createElement('li', null, '📝 Smart Tagging - View automatically generated tags'),
           React.createElement('li', null, '📂 Organization Suggestions - Get AI-powered folder recommendations')
+        )
+      )
+    ),
+    
+    // Cloud Sync Section
+    React.createElement('div', { className: 'settings-section' },
+      React.createElement('h3', null, '☁️ Cloud Sync'),
+      React.createElement('p', { className: 'settings-description' },
+        'Sync all your files to Google Drive. This will analyze and upload files from your monitored directories (Desktop, Documents, Downloads).'
+      ),
+      
+      React.createElement('div', { className: 'cloud-sync-status' },
+        React.createElement('span', { 
+          className: `sync-indicator ${syncStatus.isEnabled ? 'enabled' : 'disabled'}` 
+        }, syncStatus.isEnabled ? '🟢 Google Drive Ready' : '🔴 Not Configured'),
+        syncStatus.isRunning && React.createElement('span', { className: 'sync-running' }, 
+          '⚡ Syncing...'
+        )
+      ),
+      
+      // Enhanced Sync Progress
+      syncStatus.isRunning && React.createElement('div', { className: 'sync-progress enhanced' },
+        // Progress Header with Stats
+        React.createElement('div', { className: 'progress-header' },
+          React.createElement('div', { className: 'progress-main-stats' },
+            React.createElement('span', { className: 'progress-text' },
+              syncStatus.scanning ? 
+                'Preparing files for sync...' :
+                `${syncStatus.processedFiles || 0} of ${syncStatus.totalFiles || 0} files synced`
+            ),
+            React.createElement('span', { className: 'progress-percentage' },
+              `${Math.round(syncStatus.progress || 0)}%`
+            )
+          ),
+          !syncStatus.scanning && syncStatus.startTime && React.createElement('div', { className: 'progress-timing' },
+            React.createElement('span', { className: 'elapsed-time' },
+              `Elapsed: ${Math.floor((new Date() - syncStatus.startTime) / 1000)}s`
+            ),
+            syncStatus.processedFiles > 0 && React.createElement('span', { className: 'files-per-second' },
+              (() => {
+                const elapsedSeconds = (new Date() - syncStatus.startTime) / 1000;
+                const rate = elapsedSeconds > 0 ? syncStatus.processedFiles / elapsedSeconds : 0;
+                return `${Math.round(rate * 10) / 10} files/s`;
+              })()
+            )
+          )
+        ),
+
+        // Progress Bar
+        React.createElement('div', { className: 'progress-bar' },
+          React.createElement('div', { 
+            className: 'progress-fill',
+            style: { width: `${syncStatus.progress || 0}%` }
+          })
+        ),
+
+        // Current File Status
+        syncStatus.currentFile && React.createElement('div', { className: 'current-file-section' },
+          React.createElement('div', { className: 'current-file-header' },
+            React.createElement('span', { className: 'current-file-label' }, 
+              syncStatus.scanning ? '📋 Status' : '☁️ Currently Processing'
+            ),
+            !syncStatus.scanning && syncStatus.totalFiles > 0 && React.createElement('span', { className: 'remaining-files' },
+              `${syncStatus.totalFiles - (syncStatus.processedFiles || 0)} remaining`
+            )
+          ),
+          React.createElement('div', { className: 'current-file-name' }, 
+            syncStatus.scanning ? 
+              syncStatus.currentFile :
+              syncStatus.currentFile.split('/').pop()
+          )
+        ),
+
+        // Live Stats (when not scanning)
+        !syncStatus.scanning && React.createElement('div', { className: 'sync-live-stats' },
+          React.createElement('div', { className: 'stat-card success' },
+            React.createElement('div', { className: 'stat-number' }, syncStatus.successCount || 0),
+            React.createElement('div', { className: 'stat-label' }, 'Successful')
+          ),
+          React.createElement('div', { className: 'stat-card error' },
+            React.createElement('div', { className: 'stat-number' }, syncStatus.errorCount || 0),
+            React.createElement('div', { className: 'stat-label' }, 'Failed')
+          ),
+          React.createElement('div', { className: 'stat-card remaining' },
+            React.createElement('div', { className: 'stat-number' }, 
+              Math.max(0, (syncStatus.totalFiles || 0) - (syncStatus.processedFiles || 0))
+            ),
+            React.createElement('div', { className: 'stat-label' }, 'Remaining')
+          )
+        ),
+
+        // Professional File Activity Feed
+        !syncStatus.scanning && syncStatus.recentFiles.length > 0 && React.createElement('div', { className: 'sync-activity-feed' },
+          React.createElement('div', { className: 'activity-header' },
+            React.createElement('h4', { className: 'activity-title' }, 'File Activity'),
+            React.createElement('span', { className: 'activity-count' }, 
+              `${Math.min(syncStatus.recentFiles.length, 6)} of ${syncStatus.recentFiles.length} files`
+            )
+          ),
+          React.createElement('div', { className: 'activity-list' },
+            syncStatus.recentFiles.slice(0, 6).map((file, index) =>
+              React.createElement('div', { 
+                key: file.id,
+                className: `activity-item ${file.status}`,
+                style: { animationDelay: `${index * 0.1}s` }
+              },
+                React.createElement('div', { className: 'activity-status' },
+                  React.createElement('div', { className: 'status-icon' },
+                    file.status === 'processing' ? '⏳' :
+                    file.status === 'success' ? '✅' :
+                    file.status === 'error' ? '❌' : '📄'
+                  ),
+                  React.createElement('div', { className: 'status-line' })
+                ),
+                React.createElement('div', { className: 'activity-content' },
+                  React.createElement('div', { className: 'activity-header-line' },
+                    React.createElement('span', { className: 'activity-filename' }, file.fileName),
+                    React.createElement('span', { className: 'activity-badge' }, `#${file.processedIndex}`)
+                  ),
+                  React.createElement('div', { className: 'activity-meta' },
+                    React.createElement('span', { className: 'activity-status-text' },
+                      file.status === 'processing' ? 'Uploading...' :
+                      file.status === 'success' ? 'Successfully synced' :
+                      file.status === 'error' ? 'Sync failed' : 'Processing'
+                    ),
+                    file.completedAt && React.createElement('span', { className: 'activity-time' },
+                      `• ${file.completedAt.toLocaleTimeString()}`
+                    )
+                  ),
+                  file.status === 'error' && file.error && React.createElement('div', { className: 'activity-error' },
+                    React.createElement('small', null, file.error.substring(0, 40) + '...')
+                  )
+                )
+              )
+            )
+          )
+        )
+      ),
+      
+      // Sync Results
+      syncStatus.results.length > 0 && !syncStatus.isRunning && React.createElement('div', { className: 'sync-results' },
+        React.createElement('h4', null, '📊 Sync Results'),
+        React.createElement('div', { className: 'results-summary' },
+          React.createElement('span', { className: 'result-stat success' }, 
+            `✅ ${syncStatus.successCount} files synced successfully`
+          ),
+          React.createElement('span', { className: 'result-stat error' }, 
+            `❌ ${syncStatus.errorCount} files failed`
+          )
+        ),
+        syncStatus.errorCount > 0 && React.createElement('div', { className: 'error-files' },
+          React.createElement('details', null,
+            React.createElement('summary', null, '🔍 View failed files'),
+            React.createElement('ul', null,
+              syncStatus.results
+                .filter(result => !result.success)
+                .slice(0, 10)
+                .map((result, index) =>
+                  React.createElement('li', { key: index },
+                    React.createElement('code', null, result.fileName),
+                    ' - ',
+                    result.error
+                  )
+                )
+            )
+          )
+        )
+      ),
+      
+      // Google Drive Authentication Section
+      React.createElement('div', { className: 'google-drive-auth' },
+        React.createElement('h4', null, '🔐 Google Drive Authentication'),
+        React.createElement('div', { className: 'auth-status' },
+          googleDriveAuthStatus?.isAuthenticated ? 
+            React.createElement('div', { className: 'auth-user-info' },
+              React.createElement('div', { className: 'user-avatar' },
+                googleDriveAuthStatus.user?.photoUrl ? 
+                  React.createElement('img', { 
+                    src: googleDriveAuthStatus.user.photoUrl,
+                    alt: 'User Avatar',
+                    className: 'avatar-img'
+                  }) :
+                  React.createElement('div', { className: 'avatar-placeholder' }, '👤')
+              ),
+              React.createElement('div', { className: 'user-details' },
+                React.createElement('div', { className: 'user-name' }, 
+                  googleDriveAuthStatus.user?.name || 'Google User'
+                ),
+                React.createElement('div', { className: 'user-email' }, 
+                  googleDriveAuthStatus.user?.email || 'user@gmail.com'
+                )
+              ),
+              React.createElement('button', {
+                className: 'btn btn-secondary sign-out-btn',
+                onClick: handleGoogleDriveSignOut,
+                disabled: false
+              }, '🚪 Sign Out')
+            ) :
+            React.createElement('div', { className: 'auth-prompt' },
+              React.createElement('p', null, 'Sign in to your Google account to enable cloud sync'),
+              React.createElement('button', {
+                className: 'btn btn-primary google-signin-btn',
+                onClick: handleGoogleDriveSignIn,
+                disabled: !googleDriveAuthStatus?.configured
+              }, '🔐 Sign in with Google'),
+              !googleDriveAuthStatus?.configured && React.createElement('p', { className: 'config-warning' },
+                '⚠️ Google Drive API credentials not configured. Please check your environment variables.'
+              )
+            )
+        )
+      ),
+
+      React.createElement('div', { className: 'cloud-sync-actions' },
+        !syncStatus.isRunning ? 
+          React.createElement('div', null,
+            React.createElement('button', {
+              className: 'btn btn-primary sync-btn',
+              onClick: startBulkCloudSync,
+              disabled: !syncStatus.isEnabled || demoMode || !googleDriveAuthStatus?.isAuthenticated
+            }, 
+            demoMode && syncStatus.isEnabled && googleDriveAuthStatus?.isAuthenticated ? 
+              '🔒 Sync Disabled (Demo Mode)' :
+              syncStatus.isEnabled && googleDriveAuthStatus?.isAuthenticated ? 
+                '☁️ Sync All Files to Google Drive' : 
+                '⚠️ Google Drive Not Ready'
+            ),
+            // Debug button (only show in development)
+            React.createElement('button', {
+              className: 'btn btn-secondary',
+              onClick: () => {
+                console.log('🐛 DEBUG SYNC STATUS:', syncStatus);
+                setSyncStatus(prev => ({
+                  ...prev,
+                  scanning: false,
+                  totalFiles: 100,
+                  processedFiles: 5,
+                  currentFile: 'test-file.txt'
+                }));
+              },
+              style: { marginLeft: '8px', fontSize: '12px', padding: '6px 12px' }
+            }, '🐛 Debug')
+          ) :
+          React.createElement('div', null,
+            React.createElement('button', {
+              className: 'btn btn-warning sync-btn',
+              onClick: stopBulkCloudSync
+            }, '⏹️ Stop Sync'),
+            React.createElement('button', {
+              className: 'btn btn-secondary',
+              onClick: () => {
+                console.log('🐛 DEBUG SYNC STATUS:', syncStatus);
+                alert(`Scanning: ${syncStatus.scanning}\nTotal: ${syncStatus.totalFiles}\nProcessed: ${syncStatus.processedFiles}\nCurrent: ${syncStatus.currentFile}`);
+              },
+              style: { marginLeft: '8px', fontSize: '12px', padding: '6px 12px' }
+            }, '🐛 Debug')
+          ),
+        
+        demoMode && React.createElement('p', { className: 'demo-warning' },
+          '⚠️ File syncing is disabled in demo mode to protect your real files. You can still sign in to test Google Drive authentication.'
+        )
+      ),
+      
+      React.createElement('div', { className: 'sync-info' },
+        React.createElement('h4', null, '📋 What gets synced:'),
+        React.createElement('ul', null,
+          React.createElement('li', null, '📁 Files from Desktop, Documents, and Downloads folders'),
+          React.createElement('li', null, '🧠 AI analysis determines the best folder structure in Google Drive'),
+          React.createElement('li', null, '🔄 Progress updates in real-time'),
+          React.createElement('li', null, '📊 Detailed results and error reporting'),
+          React.createElement('li', null, '⚡ Can be stopped and resumed at any time')
         )
       )
     ),
@@ -2315,6 +5279,108 @@ function SettingsPanel({ settings, setSettings, demoMode, setDemoMode, demoDirec
         }),
         React.createElement('span', { className: 'settings-value' }, 
           `${Math.round(settings.confidenceThreshold * 100)}%`
+        )
+      )
+    ),
+
+    // High-Priority Smart Automation Features
+    React.createElement('div', { className: 'settings-section' },
+      React.createElement('h3', { className: 'automation-section-title' }, '🧠 Smart Automation Features'),
+      React.createElement('p', { className: 'automation-section-description' },
+        'Powerful AI-driven automation tools to streamline your file management workflow'
+      ),
+      React.createElement('div', { className: 'feature-showcase' },
+        React.createElement('div', { className: 'feature-item' },
+          React.createElement('div', { className: 'feature-header' },
+            React.createElement('div', { className: 'feature-icon' },
+              React.createElement('i', { className: 'fas fa-magic' })
+            ),
+            React.createElement('div', { className: 'feature-title' },
+              React.createElement('h4', null, 'Natural Language Rules'),
+              React.createElement('p', { className: 'feature-subtitle' }, 'AI-powered automation in plain English')
+            )
+          ),
+          React.createElement('p', { className: 'feature-description' }, 
+            'Transform your file organization ideas into automation rules using simple, everyday language. No coding required! Just describe what you want to happen and let AI handle the rest.'
+          ),
+          React.createElement('div', { className: 'feature-demo' },
+            React.createElement('div', { className: 'feature-input-container' },
+              React.createElement('input', {
+                type: 'text',
+                placeholder: "Try: 'Move all PDFs to Documents' or 'Archive images older than 30 days'",
+                id: 'rule-input',
+                className: 'form-control'
+              })
+            ),
+            React.createElement('div', { className: 'feature-button-container' },
+              React.createElement('button', {
+                onClick: () => testNaturalLanguageRule(),
+                className: 'btn btn-primary'
+              }, 
+                React.createElement('i', { className: 'fas fa-magic', style: { marginRight: '8px' } }),
+                'Parse Rule'
+              )
+            ),
+            React.createElement('div', { className: 'feature-examples' },
+              React.createElement('small', null, 
+                '💡 Examples: "Sync work files to Google Drive", "Delete temp files older than 7 days", "Move screenshots to Photos folder"'
+              )
+            ),
+            React.createElement('div', { id: 'rule-result', className: 'feature-result' })
+          )
+        ),
+
+        React.createElement('div', { className: 'feature-item' },
+          React.createElement('div', { className: 'feature-header' },
+            React.createElement('div', { className: 'feature-icon' },
+              React.createElement('i', { className: 'fas fa-clock' })
+            ),
+            React.createElement('div', { className: 'feature-title' },
+              React.createElement('h4', null, 'Advanced Triggers'),
+              React.createElement('p', { className: 'feature-subtitle' }, 'Automated organization around the clock')
+            )
+          ),
+          React.createElement('p', { className: 'feature-description' }, 
+            'Set up intelligent triggers that work automatically to keep your files organized. Schedule cleanups, auto-organize downloads, and create custom automation rules that run in the background.'
+          ),
+          React.createElement(SimplifiedTriggersPanel)
+        ),
+
+        React.createElement('div', { className: 'feature-item' },
+          React.createElement('div', { className: 'feature-header' },
+            React.createElement('div', { className: 'feature-icon' },
+              React.createElement('i', { className: 'fas fa-project-diagram' })
+            ),
+            React.createElement('div', { className: 'feature-title' },
+              React.createElement('h4', null, 'Visual Workflow Builder'),
+              React.createElement('p', { className: 'feature-subtitle' }, 'Drag-and-drop automation designer')
+            )
+          ),
+          React.createElement('p', { className: 'feature-description' }, 
+            'Design sophisticated automation workflows with an intuitive drag-and-drop interface. Connect triggers, actions, and conditions visually to create powerful file management automation.'
+          ),
+          React.createElement('div', { className: 'feature-demo' },
+            React.createElement('div', { className: 'workflow-showcase' },
+              React.createElement('div', { className: 'workflow-icon' },
+                React.createElement('i', { className: 'fas fa-sitemap' })
+              ),
+              React.createElement('div', { className: 'workflow-example' },
+                React.createElement('strong', null, 'Build workflows like:'),
+                React.createElement('br'),
+                React.createElement('span', { style: { color: '#667eea' } }, 
+                  'File Added → AI Classify → Move to Folder → Notify Team'
+                )
+              ),
+              React.createElement('button', {
+                onClick: () => openWorkflowBuilder(),
+                className: 'btn btn-secondary',
+                style: { marginTop: '16px' }
+              }, 
+                React.createElement('i', { className: 'fas fa-play', style: { marginRight: '8px' } }),
+                'Launch Workflow Builder'
+              )
+            )
+          )
         )
       )
     )
@@ -4589,6 +7655,299 @@ const styles = `
     align-items: flex-start;
   }
 }
+
+/* Configurable Triggers Panel Styles */
+.configurable-triggers-panel {
+  background: white;
+  border-radius: 12px;
+  padding: 24px;
+  margin-top: 20px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  border: 1px solid #e2e8f0;
+}
+
+.triggers-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid #f1f5f9;
+}
+
+.triggers-header h5 {
+  margin: 0;
+  color: #1a202c;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.triggers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.trigger-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 20px;
+  transition: all 0.3s ease;
+}
+
+.trigger-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border-color: #cbd5e0;
+}
+
+.trigger-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.trigger-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1;
+}
+
+.trigger-info > i {
+  font-size: 20px;
+  color: #4299e1;
+  margin-top: 2px;
+}
+
+.trigger-details {
+  flex: 1;
+}
+
+.trigger-details strong {
+  color: #1a202c;
+  font-size: 16px;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.trigger-details p {
+  color: #4a5568;
+  font-size: 14px;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.trigger-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trigger-toggle {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+  margin: 0;
+}
+
+.trigger-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #cbd5e0;
+  transition: 0.3s;
+  border-radius: 24px;
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: 0.3s;
+  border-radius: 50%;
+}
+
+.trigger-toggle input:checked + .toggle-slider {
+  background-color: #48bb78;
+}
+
+.trigger-toggle input:checked + .toggle-slider:before {
+  transform: translateX(20px);
+}
+
+.btn-sm {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 6px;
+  margin-left: 4px;
+}
+
+.btn-danger {
+  background: #e53e3e;
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #c53030;
+}
+
+.trigger-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.trigger-schedule, .trigger-next {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.schedule-label, .next-label {
+  font-size: 12px;
+  color: #718096;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.schedule-value, .next-value {
+  font-size: 14px;
+  color: #1a202c;
+  font-weight: 500;
+}
+
+.trigger-stats {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: #718096;
+  padding-top: 8px;
+  border-top: 1px solid #e2e8f0;
+}
+
+/* Trigger Edit Form Styles */
+.trigger-edit-form {
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 20px;
+  margin-top: 16px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-group.full-width {
+  grid-column: 1 / -1;
+}
+
+.form-group label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #2d3748;
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea {
+  padding: 8px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: border-color 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+  outline: none;
+  border-color: #4299e1;
+  box-shadow: 0 0 0 3px rgba(66, 153, 225, 0.1);
+}
+
+.form-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+/* Add Trigger Modal Styles */
+.add-trigger-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.modal-content {
+  background: white;
+  border-radius: 12px;
+  padding: 24px;
+  width: 90%;
+  max-width: 600px;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15);
+}
+
+.modal-content h4 {
+  margin: 0 0 20px 0;
+  color: #1a202c;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+@media (max-width: 768px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .trigger-summary {
+    grid-template-columns: 1fr;
+  }
+  
+  .trigger-card-header {
+    flex-direction: column;
+    gap: 12px;
+  }
+  
+  .trigger-controls {
+    align-self: flex-start;
+  }
+}
 `;
 
 // Add styles to document
@@ -5442,6 +8801,8 @@ function UndoModal({ backupRecords, onClose, onUndo, onRefresh }) {
     )
   );
 }
+
+
 
 // Render the app
 ReactDOM.render(React.createElement(App), document.getElementById('root')); 

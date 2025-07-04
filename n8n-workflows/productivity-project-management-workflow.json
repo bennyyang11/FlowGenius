@@ -1,0 +1,271 @@
+{
+  "name": "Productivity Project Management",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "project-management",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-project-management",
+      "name": "Webhook - Project Management",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "project-management-webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.integration }}",
+              "rightValue": "trello",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "route-by-platform",
+      "name": "Route by Platform",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "resource": "card",
+        "boardId": "={{ $json.task_data.board_id }}",
+        "listId": "={{ $json.task_data.list_id }}",
+        "name": "={{ $json.task_data.title }}",
+        "description": "={{ $json.task_data.description }}",
+        "additionalFields": {
+          "due": "={{ $json.task_data.due_date }}",
+          "labels": "={{ $json.task_data.labels.join(',') }}"
+        }
+      },
+      "id": "trello-create-card",
+      "name": "Create Trello Card",
+      "type": "n8n-nodes-base.trello",
+      "typeVersion": 1,
+      "position": [680, 200],
+      "credentials": {
+        "trelloApi": {
+          "id": "trello-api",
+          "name": "Trello API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendAfter",
+        "databaseId": "={{ $json.task_data.database_id }}",
+        "simple": false,
+        "properties": {
+          "values": [
+            {
+              "key": "Name",
+              "type": "title",
+              "title": "={{ $json.task_data.title }}"
+            },
+            {
+              "key": "Status",
+              "type": "select",
+              "select": "To Do"
+            },
+            {
+              "key": "Priority",
+              "type": "select",
+              "select": "={{ $json.file_metadata.confidence > 0.8 ? 'High' : 'Medium' }}"
+            },
+            {
+              "key": "Category",
+              "type": "select",
+              "select": "={{ $json.file_metadata.classification }}"
+            },
+            {
+              "key": "Due Date",
+              "type": "date",
+              "date": "={{ $json.task_data.due_date }}"
+            }
+          ]
+        }
+      },
+      "id": "notion-create-page",
+      "name": "Create Notion Page",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "credentials": {
+        "notionApi": {
+          "id": "notion-api",
+          "name": "Notion API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "resource": "task",
+        "projectId": "={{ $json.task_data.project_id }}",
+        "name": "={{ $json.task_data.title }}",
+        "additionalFields": {
+          "notes": "={{ $json.task_data.description }}",
+          "assignee": "={{ $json.task_data.assignee }}",
+          "dueOn": "={{ $json.task_data.due_date }}",
+          "tags": "={{ $json.task_data.labels.join(',') }}"
+        }
+      },
+      "id": "asana-create-task",
+      "name": "Create Asana Task",
+      "type": "n8n-nodes-base.asana",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "asanaApi": {
+          "id": "asana-api",
+          "name": "Asana API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst result = [];\n\nfor (const item of items) {\n  const success = item.json.error === undefined;\n  const platform = $('Webhook - Project Management').first().json.integration;\n  \n  let taskId, taskUrl;\n  \n  if (platform === 'trello') {\n    taskId = item.json.id;\n    taskUrl = item.json.url;\n  } else if (platform === 'notion') {\n    taskId = item.json.id;\n    taskUrl = item.json.url;\n  } else if (platform === 'asana') {\n    taskId = item.json.gid;\n    taskUrl = `https://app.asana.com/0/${item.json.projects[0].gid}/${item.json.gid}`;\n  }\n  \n  const response = {\n    success: success,\n    message: success ? `Task created successfully in ${platform}` : `Failed to create task in ${platform}`,\n    platform: platform,\n    task_id: taskId,\n    task_url: taskUrl,\n    task_title: $('Webhook - Project Management').first().json.task_data.title,\n    timestamp: new Date().toISOString(),\n    error: item.json.error || null\n  };\n  \n  result.push({ json: response });\n}\n\nreturn result;"
+      },
+      "id": "format-response",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Project Management": {
+      "main": [
+        [
+          {
+            "node": "Route by Platform",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Platform": {
+      "main": [
+        [
+          {
+            "node": "Create Trello Card",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Notion Page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Asana Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Trello Card": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Notion Page": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Asana Task": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "flowgenius-productivity-integration"
+  },
+  "id": "productivity-project-management",
+  "tags": [
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "project-management",
+      "name": "project-management"
+    },
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "productivity",
+      "name": "productivity"
+    }
+  ]
+} 

@@ -1,3 +1,6 @@
+// Load environment variables from .env file first
+require('dotenv').config();
+
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -8,6 +11,8 @@ const { WorkflowOrchestrator } = require('./workflows/orchestrator');
 const { AuthService } = require('./services/authService');
 const { DemoService } = require('./services/demoService');
 const { SearchService } = require('./services/searchService');
+const { NaturalLanguageRuleService } = require('./services/naturalLanguageRuleService');
+const { AdvancedTriggersService } = require('./services/advancedTriggersService');
 const os = require('os');
 
 // Initialize electron store for persistent settings
@@ -20,6 +25,8 @@ let workflowOrchestrator;
 let authService;
 let demoService;
 let searchService;
+let naturalLanguageRuleService;
+let advancedTriggersService;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -79,6 +86,15 @@ async function initializeServices() {
     searchService = new SearchService();
     await searchService.initialize();
     
+    // Initialize Natural Language Rule Service
+    naturalLanguageRuleService = new NaturalLanguageRuleService();
+    console.log('🧠 Natural Language Rule Service initialized');
+    
+    // Initialize Advanced Triggers Service
+    advancedTriggersService = new AdvancedTriggersService();
+    advancedTriggersService.initialize();
+    console.log('🕐 Advanced Triggers Service initialized');
+    
     // N8n configuration
     const n8nConfig = {
       enabled: true, // Set to false to disable n8n and use in-memory storage
@@ -94,7 +110,21 @@ async function initializeServices() {
 
     // Initialize workflow orchestrator with n8n backup service
     workflowOrchestrator = new WorkflowOrchestrator(aiService, n8nConfig);
-    console.log('Workflow Orchestrator initialized with n8n backup service');
+    await workflowOrchestrator.initialize();
+    console.log('Workflow Orchestrator with Productivity Integration initialized');
+    
+    // Enable productivity integrations for testing
+    // Note: These require proper N8N workflows and credentials to be configured
+    workflowOrchestrator.enableProductivityIntegration('smart-backup', {
+      provider: 'aws-s3',
+      enabled: true,
+      retentionDays: 30
+    });
+    
+    console.log('🚀 Productivity integrations configured:');
+    console.log('  - Smart Backup: Enabled (requires N8N workflow)');
+    console.log('  - To enable more integrations, configure N8N workflows first');
+    console.log('  - See PRODUCTIVITY_INTEGRATION_GUIDE.md for setup instructions');
 
     // Initialize and start file monitor
     fileMonitor = new FileMonitorService(aiService, workflowOrchestrator);
@@ -362,6 +392,566 @@ ipcMain.handle('get-monitoring-status', async () => {
   };
 });
 
+// Productivity Integration IPC Handlers
+ipcMain.handle('get-productivity-integrations', async () => {
+  if (workflowOrchestrator) {
+    return workflowOrchestrator.getProductivityIntegrations();
+  }
+  return [];
+});
+
+ipcMain.handle('get-productivity-workflows', async () => {
+  if (workflowOrchestrator) {
+    return workflowOrchestrator.getProductivityWorkflows();
+  }
+  return [];
+});
+
+ipcMain.handle('get-cloud-sync-status', async () => {
+  if (workflowOrchestrator) {
+    try {
+      const config = workflowOrchestrator.getConfig();
+      return {
+        enabled: config.enableCloudSync || true, // Default to true
+        provider: config.productivityConfig?.cloudStorage?.provider || 'google-drive',
+        // Include bulk sync state
+        isRunning: bulkSyncState.isRunning,
+        totalFiles: bulkSyncState.totalFiles,
+        processedFiles: bulkSyncState.processedFiles,
+        successCount: bulkSyncState.successCount,
+        errorCount: bulkSyncState.errorCount
+      };
+    } catch (error) {
+      console.error('Failed to get cloud sync status:', error);
+      return { 
+        enabled: false, 
+        provider: null,
+        isRunning: false,
+        totalFiles: 0,
+        processedFiles: 0,
+        successCount: 0,
+        errorCount: 0
+      };
+    }
+  }
+  return { 
+    enabled: false, 
+    provider: null,
+    isRunning: false,
+    totalFiles: 0,
+    processedFiles: 0,
+    successCount: 0,
+    errorCount: 0
+  };
+});
+
+// Bulk Cloud Sync functionality
+let bulkSyncState = {
+  isRunning: false,
+  shouldStop: false,
+  totalFiles: 0,
+  processedFiles: 0,
+  successCount: 0,
+  errorCount: 0,
+  results: []
+};
+
+ipcMain.handle('start-bulk-cloud-sync', async (event) => {
+  if (bulkSyncState.isRunning) {
+    return { success: false, error: 'Bulk sync already running' };
+  }
+
+  if (!workflowOrchestrator) {
+    return { success: false, error: 'Workflow orchestrator not available' };
+  }
+
+  try {
+    // Reset state
+    bulkSyncState = {
+      isRunning: true,
+      shouldStop: false,
+      totalFiles: 0,
+      processedFiles: 0,
+      successCount: 0,
+      errorCount: 0,
+      results: []
+    };
+
+    console.log('🚀 Starting bulk cloud sync...');
+    console.log(`📡 Event sender object:`, event.sender ? 'Available' : 'NOT AVAILABLE');
+    
+    // Start the sync process in the background (non-blocking)
+    setImmediate(() => {
+      processBulkSync(event.sender);
+    });
+    
+    return { success: true };
+  } catch (error) {
+    bulkSyncState.isRunning = false;
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('stop-bulk-cloud-sync', async () => {
+  bulkSyncState.shouldStop = true;
+  bulkSyncState.isRunning = false;
+  console.log('⏹️ Bulk sync stopped by user');
+  return { success: true };
+});
+
+
+
+// Add a test IPC handler to verify communication
+ipcMain.handle('test-ipc-communication', async () => {
+  console.log('🧪 Backend received IPC test request');
+  return { success: true, message: 'IPC communication working!' };
+});
+
+// Add a test event sender to verify event communication
+ipcMain.handle('test-sync-events', async (event) => {
+  console.log('🧪 Testing sync event communication...');
+  
+  // Send a test progress event
+  event.sender.send('bulk-sync-progress', {
+    isRunning: true,
+    progress: 25,
+    totalFiles: 100,
+    processedFiles: 25,
+    successCount: 20,
+    errorCount: 5,
+    currentFile: '/test/fake-file.txt'
+  });
+  
+  console.log('📡 Test sync event sent to frontend');
+  return { success: true, message: 'Test sync event sent!' };
+});
+
+async function processBulkSync(sender) {
+  console.log('🚀 processBulkSync started with sender:', !!sender);
+  
+  try {
+    // Get all files from monitored directories
+    const fs = require('fs').promises;
+    const path = require('path');
+    const os = require('os');
+
+    const monitoredDirs = [
+      path.join(os.homedir(), 'Desktop'),
+      path.join(os.homedir(), 'Documents'), 
+      path.join(os.homedir(), 'Downloads')
+    ];
+
+    console.log('📁 Scanning monitored directories for files...');
+    
+    // Send initial scanning status
+    console.log('📡 Sending initial scanning status to frontend');
+    sender.send('bulk-sync-progress', {
+      isRunning: true,
+      progress: 0,
+      totalFiles: 0,
+      processedFiles: 0,
+      successCount: 0,
+      errorCount: 0,
+      currentFile: 'Scanning directories...',
+      scanning: true
+    });
+    
+    // Collect all files with progress updates
+    const allFiles = [];
+    for (let i = 0; i < monitoredDirs.length; i++) {
+      const dir = monitoredDirs[i];
+      try {
+        console.log(`📂 Scanning ${dir}...`);
+        console.log(`📡 Sending directory scan progress for ${path.basename(dir)}`);
+        sender.send('bulk-sync-progress', {
+          isRunning: true,
+          progress: 0,
+          totalFiles: 0,
+          processedFiles: 0,
+          successCount: 0,
+          errorCount: 0,
+          currentFile: `Scanning ${path.basename(dir)} folder...`,
+          scanning: true
+        });
+        
+        const files = await getAllFilesRecursively(dir);
+        allFiles.push(...files);
+        console.log(`📊 Found ${files.length} files in ${dir}`);
+      } catch (error) {
+        console.error(`Failed to scan directory ${dir}:`, error);
+      }
+    }
+
+    console.log(`📊 Total files found: ${allFiles.length}, now filtering...`);
+    
+    // Send filtering progress
+    sender.send('bulk-sync-progress', {
+      isRunning: true,
+      progress: 0,
+      totalFiles: 0,
+      processedFiles: 0,
+      successCount: 0,
+      errorCount: 0,
+      currentFile: `Filtering ${allFiles.length} files...`,
+      scanning: true
+    });
+
+    // Filter out large files (>50MB) and system files with progress
+    const syncableFiles = [];
+    const filterBatchSize = 100; // Process files in batches
+    
+    for (let i = 0; i < allFiles.length; i += filterBatchSize) {
+      const batch = allFiles.slice(i, Math.min(i + filterBatchSize, allFiles.length));
+      
+      for (const filePath of batch) {
+        try {
+          const stats = require('fs').statSync(filePath);
+          const fileName = path.basename(filePath);
+          
+          // Skip files larger than 50MB
+          if (stats.size > 50 * 1024 * 1024) continue;
+          
+          // Skip system files and hidden files
+          if (fileName.startsWith('.')) continue;
+          if (fileName.includes('.DS_Store')) continue;
+          if (fileName.includes('Thumbs.db')) continue;
+          
+          syncableFiles.push(filePath);
+        } catch (error) {
+          // Skip files we can't access
+          continue;
+        }
+      }
+      
+      // Send progress update every batch
+      if (i % (filterBatchSize * 5) === 0) { // Every 500 files
+        sender.send('bulk-sync-progress', {
+          isRunning: true,
+          progress: Math.round((i / allFiles.length) * 100),
+          totalFiles: 0,
+          processedFiles: 0,
+          successCount: 0,
+          errorCount: 0,
+          currentFile: `Filtering ${i}/${allFiles.length} files...`,
+          scanning: true
+        });
+        
+        // Small delay to keep UI responsive
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+
+    bulkSyncState.totalFiles = syncableFiles.length;
+    
+    console.log(`📊 Found ${syncableFiles.length} syncable files (filtered from ${allFiles.length})`);
+
+    // Send initial sync progress (filtering complete)
+    console.log(`📡 Sending initial sync progress to frontend: totalFiles=${bulkSyncState.totalFiles}`);
+    sender.send('bulk-sync-progress', {
+      isRunning: true,
+      progress: 0,
+      totalFiles: bulkSyncState.totalFiles,
+      processedFiles: 0,
+      successCount: 0,
+      errorCount: 0,
+      currentFile: `Ready to sync ${bulkSyncState.totalFiles} files`,
+      scanning: false
+    });
+
+    // Process files in smaller batches with better CPU throttling
+    const batchSize = 3; // Process 3 files at a time (reduced from 5)
+    const delayBetweenFiles = 500; // 500ms delay between each file (increased from 200ms)
+    const delayBetweenBatches = 1000; // 1 second delay between batches
+    
+    for (let i = 0; i < syncableFiles.length; i += batchSize) {
+      if (bulkSyncState.shouldStop) break;
+
+      const batch = syncableFiles.slice(i, Math.min(i + batchSize, syncableFiles.length));
+      const batchNumber = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(syncableFiles.length / batchSize);
+      
+      console.log(`📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} files)`);
+      
+      // Process batch
+      for (const filePath of batch) {
+        if (bulkSyncState.shouldStop) break;
+
+        const fileName = path.basename(filePath);
+        const stats = require('fs').statSync(filePath);
+        
+        console.log(`☁️ Syncing: ${fileName}`);
+
+        try {
+          // Create file data for productivity service
+          const fileData = {
+            filePath: filePath,
+            fileName: fileName,
+            fileSize: stats.size,
+            classification: 'document', // Will be determined by AI
+            confidence: 0.8,
+            tags: [path.extname(fileName).slice(1)],
+            organizationSuggestion: {
+              relativePath: 'BulkSync/' + path.dirname(filePath).split('/').pop(),
+              fullPath: filePath
+            }
+          };
+
+          // Sync to Google Drive directly (bypasses N8N)
+          const result = await workflowOrchestrator.productivityService.executeCloudStorageSyncDirect(fileData, 'google-drive');
+          
+          if (result.success) {
+            bulkSyncState.successCount++;
+            bulkSyncState.results.push({
+              fileName: fileName,
+              filePath: filePath,
+              success: true,
+              message: 'Successfully synced'
+            });
+
+            // Send real-time monitoring update for successful sync
+            sender.send('monitoring-update', {
+              type: 'cloud-sync-success',
+              message: `✅ Synced to Google Drive: ${fileName}`,
+              filePath: filePath,
+              details: `File successfully uploaded to Google Drive`,
+              statType: 'filesProcessed'
+            });
+          } else {
+            bulkSyncState.errorCount++;
+            bulkSyncState.results.push({
+              fileName: fileName,
+              filePath: filePath,
+              success: false,
+              error: result.message || 'Sync failed'
+            });
+
+            // Send real-time monitoring update for failed sync
+            sender.send('monitoring-update', {
+              type: 'cloud-sync-error',
+              message: `❌ Sync failed: ${fileName}`,
+              filePath: filePath,
+              details: `Error: ${result.error || result.message || 'Unknown error'}`,
+              statType: 'errorsEncountered'
+            });
+          }
+        } catch (error) {
+          console.error(`Failed to sync ${fileName}:`, error);
+          bulkSyncState.errorCount++;
+          bulkSyncState.results.push({
+            fileName: fileName,
+            filePath: filePath,
+            success: false,
+            error: error.message
+          });
+        }
+
+        bulkSyncState.processedFiles++;
+        
+        // Send progress update to UI
+        const progressData = {
+          isRunning: true,
+          progress: Math.round((bulkSyncState.processedFiles / bulkSyncState.totalFiles) * 100),
+          totalFiles: bulkSyncState.totalFiles,
+          processedFiles: bulkSyncState.processedFiles,
+          successCount: bulkSyncState.successCount,
+          errorCount: bulkSyncState.errorCount,
+          currentFile: filePath
+        };
+        console.log(`📡 Sending progress update: ${bulkSyncState.processedFiles}/${bulkSyncState.totalFiles} (${progressData.progress}%)`);
+        sender.send('bulk-sync-progress', progressData);
+        
+        // Longer delay to prevent overwhelming the system and reduce CPU usage
+        await new Promise(resolve => setTimeout(resolve, delayBetweenFiles));
+      }
+      
+      // Longer pause between batches to give CPU a break
+      if (i + batchSize < syncableFiles.length && !bulkSyncState.shouldStop) {
+        console.log(`⏸️ Pausing for ${delayBetweenBatches}ms between batches...`);
+        await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+      }
+    }
+
+    // Final completion
+    bulkSyncState.isRunning = false;
+    
+    console.log(`✅ Bulk sync completed: ${bulkSyncState.successCount} successful, ${bulkSyncState.errorCount} failed`);
+    
+    // Send bulk sync completion
+    sender.send('bulk-sync-complete', {
+      totalFiles: bulkSyncState.totalFiles,
+      successCount: bulkSyncState.successCount,
+      errorCount: bulkSyncState.errorCount,
+      results: bulkSyncState.results
+    });
+
+    // Update monitoring stats
+    console.log(`📊 Sending cloud-sync-stats-update: synced=${bulkSyncState.successCount}, errors=${bulkSyncState.errorCount}`);
+    sender.send('cloud-sync-stats-update', {
+      totalSynced: bulkSyncState.successCount,
+      syncErrors: bulkSyncState.errorCount,
+      lastSync: new Date().toISOString(),
+      isActive: false
+    });
+
+    // Send monitoring update
+    sender.send('monitoring-update', {
+      type: 'cloud-sync-complete',
+      message: `☁️ Bulk sync completed: ${bulkSyncState.successCount} files synced successfully`,
+      filePath: null,
+      details: `Total: ${bulkSyncState.totalFiles} files, Success: ${bulkSyncState.successCount}, Errors: ${bulkSyncState.errorCount}`,
+      statType: 'filesProcessed'
+    });
+
+  } catch (error) {
+    console.error('Bulk sync failed:', error);
+    bulkSyncState.isRunning = false;
+    
+    sender.send('bulk-sync-complete', {
+      totalFiles: bulkSyncState.totalFiles,
+      successCount: bulkSyncState.successCount,
+      errorCount: bulkSyncState.errorCount,
+      results: bulkSyncState.results,
+      error: error.message
+    });
+  }
+}
+
+async function getAllFilesRecursively(dir) {
+  const fs = require('fs').promises;
+  const path = require('path');
+  
+  let files = [];
+  
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      
+      if (entry.isDirectory()) {
+        // Skip some common system directories
+        if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'Library') {
+          continue;
+        }
+        
+        // Recursively get files from subdirectory
+        try {
+          const subFiles = await getAllFilesRecursively(fullPath);
+          files.push(...subFiles);
+        } catch (error) {
+          // Skip directories we can't access
+          continue;
+        }
+      } else if (entry.isFile()) {
+        files.push(fullPath);
+      }
+    }
+  } catch (error) {
+    // Return empty array if we can't access the directory
+    return [];
+  }
+  
+  return files;
+}
+
+ipcMain.handle('test-productivity-integration', async (event, integrationType) => {
+  if (!workflowOrchestrator) {
+    return { success: false, error: 'Workflow orchestrator not available' };
+  }
+
+  try {
+    // Create test file data
+    const testFileData = {
+      filePath: '/test/sample-document.pdf',
+      fileName: 'sample-document.pdf',
+      fileSize: 1024000,
+      classification: 'work',
+      confidence: 0.92,
+      tags: ['important', 'review', 'document'],
+      organizationSuggestion: {
+        relativePath: 'Documents/Work/Important',
+        fullPath: '/Users/test/Documents/Work/Important/sample-document.pdf',
+        reasoning: 'High confidence work document'
+      },
+      importance: 'high'
+    };
+
+    console.log(`🧪 Testing productivity integration: ${integrationType}`);
+
+    let result;
+    switch (integrationType) {
+      case 'smart-backup':
+        result = await workflowOrchestrator.productivityService.executeSmartBackup(testFileData);
+        break;
+      case 'cloud-sync':
+        result = await workflowOrchestrator.productivityService.executeCloudStorageSyncDirect(testFileData, 'google-drive');
+        
+        // Send real-time update to UI
+        event.sender.send('productivity-integration-update', {
+          type: 'cloud-sync',
+          integration: 'google-drive',
+          fileName: testFileData.fileName,
+          success: result.success,
+          message: result.message || (result.success ? 'Test sync successful' : 'Test sync failed'),
+          details: JSON.stringify(result)
+        });
+
+        // Also send test cloud sync stats update for testing
+        if (result.success) {
+          console.log('📊 Sending test cloud-sync-stats-update');
+          event.sender.send('cloud-sync-stats-update', {
+            totalSynced: 1,
+            syncErrors: 0,
+            lastSync: new Date().toISOString(),
+            isActive: false
+          });
+        }
+        break;
+      case 'team-notification':
+        result = await workflowOrchestrator.productivityService.executeTeamNotification(testFileData, 'slack', {
+          channel: '#test-channel',
+          message: 'Test productivity integration'
+        });
+        
+        // Send real-time update to UI
+        event.sender.send('productivity-integration-update', {
+          type: 'team-notification',
+          integration: 'slack',
+          fileName: testFileData.fileName,
+          success: result.success,
+          message: result.message || (result.success ? 'Test notification successful' : 'Test notification failed'),
+          details: JSON.stringify(result)
+        });
+        break;
+      case 'project-management':
+        result = await workflowOrchestrator.productivityService.executeProjectManagement(testFileData, 'trello', {
+          boardId: 'test-board',
+          listId: 'test-list'
+        });
+        
+        // Send real-time update to UI
+        event.sender.send('productivity-integration-update', {
+          type: 'project-management',
+          integration: 'trello',
+          fileName: testFileData.fileName,
+          success: result.success,
+          message: result.message || (result.success ? 'Test project sync successful' : 'Test project sync failed'),
+          details: JSON.stringify(result)
+        });
+        break;
+      default:
+        return { success: false, error: `Unknown integration type: ${integrationType}` };
+    }
+
+    console.log(`✅ Productivity integration test result:`, result);
+    return { success: true, result };
+
+  } catch (error) {
+    console.error(`❌ Productivity integration test failed:`, error);
+    return { success: false, error: error.message };
+  }
+});
+
 // Global queue simulation state
 let queueSimulation = {
   isRunning: false,
@@ -613,4 +1203,232 @@ ipcMain.handle('undo-multiple-organizations', async (event, backupIds) => {
     }
   }
   return { success: false, error: 'Workflow orchestrator not initialized' };
-}); 
+});
+
+// Google Drive Authentication handlers
+ipcMain.handle('google-drive-authenticate', async () => {
+  try {
+    if (!workflowOrchestrator) {
+      return { success: false, error: 'Workflow orchestrator not available' };
+    }
+    
+    const result = await workflowOrchestrator.productivityService.authenticateGoogleDrive();
+    return result;
+  } catch (error) {
+    console.error('Google Drive authentication error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('google-drive-sign-out', async () => {
+  try {
+    if (!workflowOrchestrator) {
+      return { success: false, error: 'Workflow orchestrator not available' };
+    }
+    
+    const result = await workflowOrchestrator.productivityService.signOutGoogleDrive();
+    return result;
+  } catch (error) {
+    console.error('Google Drive sign out error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('google-drive-auth-status', async () => {
+  try {
+    if (!workflowOrchestrator) {
+      return { 
+        isAuthenticated: false, 
+        user: null, 
+        configured: false,
+        error: 'Workflow orchestrator not available' 
+      };
+    }
+    
+    const status = await workflowOrchestrator.productivityService.getGoogleDriveAuthStatus();
+    return status;
+  } catch (error) {
+    console.error('Google Drive auth status error:', error);
+    return { 
+      isAuthenticated: false, 
+      user: null, 
+      configured: false,
+      error: error.message 
+    };
+  }
+});
+
+ipcMain.handle('google-drive-storage-info', async () => {
+  try {
+    if (!workflowOrchestrator) {
+      return { error: 'Workflow orchestrator not available' };
+    }
+    
+    const storageInfo = await workflowOrchestrator.productivityService.getGoogleDriveStorageInfo();
+    return storageInfo;
+  } catch (error) {
+    console.error('Google Drive storage info error:', error);
+    return { error: error.message };
+  }
+});
+
+ipcMain.handle('google-drive-sync-file', async (event, fileData) => {
+  try {
+    if (!workflowOrchestrator) {
+      return { success: false, error: 'Workflow orchestrator not available' };
+    }
+    
+    const result = await workflowOrchestrator.productivityService.syncFileToGoogleDrive(fileData);
+    return result;
+  } catch (error) {
+    console.error('Google Drive sync error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Natural Language Rule Service IPC Handlers
+ipcMain.handle('parse-natural-language-rule', async (event, ruleText) => {
+  try {
+    if (!naturalLanguageRuleService) {
+      return { success: false, error: 'Natural language rule service not available' };
+    }
+    
+    const parsedRule = await naturalLanguageRuleService.parseRule(ruleText);
+    return { success: true, rule: parsedRule };
+  } catch (error) {
+    console.error('Natural language rule parsing error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-all-rules', async () => {
+  if (naturalLanguageRuleService) {
+    return naturalLanguageRuleService.getAllRules();
+  }
+  return [];
+});
+
+ipcMain.handle('execute-rule', async (event, ruleId, fileData) => {
+  try {
+    if (!naturalLanguageRuleService) {
+      return { success: false, error: 'Natural language rule service not available' };
+    }
+    
+    const result = await naturalLanguageRuleService.executeRule(ruleId, fileData);
+    return { success: true, result };
+  } catch (error) {
+    console.error('Rule execution error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-rule-examples', async () => {
+  if (naturalLanguageRuleService) {
+    return naturalLanguageRuleService.getRuleExamples();
+  }
+  return [];
+});
+
+// Advanced Triggers Service IPC Handlers
+ipcMain.handle('get-all-triggers', async () => {
+  if (advancedTriggersService) {
+    return advancedTriggersService.getAllTriggers();
+  }
+  return [];
+});
+
+ipcMain.handle('get-available-actions', async () => {
+  if (advancedTriggersService) {
+    return advancedTriggersService.getAvailableActions();
+  }
+  return [];
+});
+
+ipcMain.handle('get-schedule-options', async () => {
+  if (advancedTriggersService) {
+    return advancedTriggersService.getScheduleOptions();
+  }
+  return [];
+});
+
+ipcMain.handle('update-trigger', async (event, triggerId, updates) => {
+  try {
+    if (!advancedTriggersService) {
+      return { success: false, error: 'Advanced triggers service not available' };
+    }
+    
+    const updatedTrigger = await advancedTriggersService.updateTrigger(triggerId, updates);
+    return { success: true, trigger: updatedTrigger };
+  } catch (error) {
+    console.error('Trigger update error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('add-trigger', async (event, triggerConfig) => {
+  try {
+    if (!advancedTriggersService) {
+      return { success: false, error: 'Advanced triggers service not available' };
+    }
+    
+    const triggerId = await advancedTriggersService.addTrigger(triggerConfig);
+    return { success: true, triggerId };
+  } catch (error) {
+    console.error('Trigger creation error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('delete-trigger', async (event, triggerId) => {
+  try {
+    if (!advancedTriggersService) {
+      return { success: false, error: 'Advanced triggers service not available' };
+    }
+    
+    const result = await advancedTriggersService.deleteTrigger(triggerId);
+    return { success: true, deleted: result };
+  } catch (error) {
+    console.error('Trigger deletion error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('execute-trigger', async (event, triggerId) => {
+  try {
+    if (!advancedTriggersService) {
+      return { success: false, error: 'Advanced triggers service not available' };
+    }
+    
+    await advancedTriggersService.executeTrigger(triggerId);
+    return { success: true };
+  } catch (error) {
+    console.error('Trigger execution error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-trigger-examples', async () => {
+  if (advancedTriggersService) {
+    return advancedTriggersService.getTriggerExamples();
+  }
+  return [];
+});
+
+// Visual Workflow Editor IPC Handlers
+ipcMain.handle('execute-visual-workflow', async (event, workflowData) => {
+  try {
+    console.log('🔄 Executing visual workflow:', workflowData.workflowId);
+    
+    // Simulate workflow execution
+    const result = {
+      success: true,
+      executedNodes: workflowData.workflow?.nodes?.length || 0,
+      message: `Workflow "${workflowData.workflow?.name}" executed successfully`
+    };
+    
+    return result;
+  } catch (error) {
+    console.error('Visual workflow execution error:', error);
+    return { success: false, error: error.message };
+  }
+});

@@ -2,6 +2,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const { EventEmitter } = require('events');
 const N8nBackupService = require('../services/n8nBackupService');
+const { ProductivityIntegrationService } = require('../services/productivityIntegrationService');
 
 class WorkflowOrchestrator extends EventEmitter {
   constructor(aiService, n8nConfig = {}) {
@@ -16,6 +17,12 @@ class WorkflowOrchestrator extends EventEmitter {
     this.n8nBackupService = new N8nBackupService(n8nConfig);
     this.useN8nBackup = n8nConfig.enabled !== false; // Default to true if config provided
     
+    // Initialize productivity integration service
+    this.productivityService = new ProductivityIntegrationService({
+      ...n8nConfig,
+      isDemoMode: n8nConfig.isDemoMode || false
+    });
+    
     // Fallback to in-memory storage if n8n is not available
     this.backupRecords = []; // Store backup records for undo functionality (fallback)
     
@@ -25,7 +32,18 @@ class WorkflowOrchestrator extends EventEmitter {
       createDirectories: true,
       backupBeforeMove: true,
       maxBackupFiles: 100,
-      dryRun: false // Set to true for testing
+      dryRun: false, // Set to true for testing
+      // Productivity integration settings
+      enableCloudSync: false,
+      enableTeamNotifications: false,
+      enableProjectManagement: false,
+      enableSmartBackup: true, // Default to true for backup automation
+      productivityConfig: {
+        cloudStorage: { provider: 'google-drive', enabled: false },
+        teamNotification: { provider: 'slack', channel: '#file-organization', enabled: false },
+        projectManagement: { provider: 'trello', boardId: null, enabled: false },
+        smartBackup: { provider: 'aws-s3', enabled: true }
+      }
     };
   }
 
@@ -36,7 +54,13 @@ class WorkflowOrchestrator extends EventEmitter {
     // Set up N8N workflow templates
     await this.setupN8NWorkflows();
     
-    console.log('Workflow Orchestrator initialized');
+    // Initialize productivity integration service
+    await this.productivityService.initialize();
+    
+    // Setup productivity workflow event listeners
+    this.setupProductivityEventListeners();
+    
+    console.log('Workflow Orchestrator with Productivity Integration initialized');
   }
 
   loadDefaultRules() {
@@ -334,6 +358,11 @@ class WorkflowOrchestrator extends EventEmitter {
         timestamp: new Date()
       });
 
+      // Trigger productivity workflows after successful organization (if not in demo mode)
+      if (!isDemoMode) {
+        await this.triggerProductivityWorkflows(analysis, { originalPath: filePath, newPath: actualTargetPath });
+      }
+
     } catch (error) {
       console.error(`Failed to organize file ${filePath}:`, error);
       throw error;
@@ -526,6 +555,195 @@ class WorkflowOrchestrator extends EventEmitter {
 
   getWorkflowHistory() {
     return [...this.workflowHistory];
+  }
+
+  setupProductivityEventListeners() {
+    // Listen for productivity workflow completion/failure events
+    this.productivityService.on('workflow-completed', (event) => {
+      console.log(`✅ Productivity workflow completed: ${event.type}`);
+      this.emit('productivity-workflow-completed', event);
+    });
+
+    this.productivityService.on('workflow-failed', (event) => {
+      console.error(`❌ Productivity workflow failed: ${event.type} - ${event.error}`);
+      this.emit('productivity-workflow-failed', event);
+    });
+  }
+
+  async triggerProductivityWorkflows(analysis, paths) {
+    const { originalPath, newPath } = paths;
+    const promises = [];
+
+    // Prepare file data for productivity workflows
+    const fileData = {
+      filePath: newPath,
+      fileName: analysis.fileName,
+      fileSize: analysis.fileSize,
+      classification: analysis.classification,
+      confidence: analysis.confidence,
+      tags: analysis.tags || [],
+      organizationSuggestion: analysis.organizationSuggestion,
+      importance: analysis.importance || 'medium',
+      originalPath,
+      newPath
+    };
+
+    console.log(`🚀 Triggering productivity workflows for ${analysis.fileName}`);
+
+    // 1. Smart Backup (always enabled by default)
+    if (this.config.enableSmartBackup && this.config.productivityConfig.smartBackup.enabled) {
+      const backupConfig = {
+        storageProvider: this.config.productivityConfig.smartBackup.provider,
+        retentionDays: 30,
+        compressionLevel: 'standard',
+        encryptionEnabled: true
+      };
+      
+      promises.push(
+        this.productivityService.executeSmartBackup(fileData, backupConfig)
+          .catch(error => console.error('Smart backup failed:', error))
+      );
+    }
+
+    // 2. Cloud Storage Sync
+    if (this.config.enableCloudSync && this.config.productivityConfig.cloudStorage.enabled) {
+      const provider = this.config.productivityConfig.cloudStorage.provider;
+      
+      promises.push(
+        this.productivityService.executeCloudStorageSync(fileData, provider)
+          .catch(error => console.error('Cloud sync failed:', error))
+      );
+    }
+
+    // 3. Team Notifications
+    if (this.config.enableTeamNotifications && this.config.productivityConfig.teamNotification.enabled) {
+      const provider = this.config.productivityConfig.teamNotification.provider;
+      const options = {
+        channel: this.config.productivityConfig.teamNotification.channel,
+        message: `File organized automatically`,
+        includePreview: true,
+        mentionTeam: this.shouldMentionTeam(fileData)
+      };
+      
+      promises.push(
+        this.productivityService.executeTeamNotification(fileData, provider, options)
+          .catch(error => console.error('Team notification failed:', error))
+      );
+    }
+
+    // 4. Project Management Integration
+    if (this.config.enableProjectManagement && this.config.productivityConfig.projectManagement.enabled) {
+      const provider = this.config.productivityConfig.projectManagement.provider;
+      const projectConfig = {
+        boardId: this.config.productivityConfig.projectManagement.boardId,
+        listId: 'to-do',
+        assignee: null,
+        dueDate: this.calculateTaskDueDate(fileData),
+        labels: ['file-organization', 'auto-generated']
+      };
+      
+      promises.push(
+        this.productivityService.executeProjectManagement(fileData, provider, projectConfig)
+          .catch(error => console.error('Project management integration failed:', error))
+      );
+    }
+
+    // Execute all productivity workflows in parallel
+    if (promises.length > 0) {
+      try {
+        const results = await Promise.allSettled(promises);
+        const successful = results.filter(r => r.status === 'fulfilled').length;
+        const failed = results.filter(r => r.status === 'rejected').length;
+        
+        console.log(`📊 Productivity workflows completed: ${successful} successful, ${failed} failed`);
+        
+        this.emit('productivity-workflows-completed', {
+          fileData,
+          results,
+          successful,
+          failed,
+          timestamp: new Date()
+        });
+      } catch (error) {
+        console.error('Error executing productivity workflows:', error);
+      }
+    }
+  }
+
+  shouldMentionTeam(fileData) {
+    // Mention team for high-importance files or work-related files
+    return fileData.importance === 'high' || 
+           fileData.classification === 'work' || 
+           fileData.confidence > 0.9;
+  }
+
+  calculateTaskDueDate(fileData) {
+    // Set due date based on file importance and classification
+    const now = new Date();
+    let daysToAdd = 7; // Default: 1 week
+
+    if (fileData.importance === 'high' || fileData.classification === 'financial') {
+      daysToAdd = 3; // 3 days for important files
+    } else if (fileData.importance === 'low' || fileData.classification === 'temporary') {
+      daysToAdd = 14; // 2 weeks for low priority
+    }
+
+    const dueDate = new Date(now);
+    dueDate.setDate(now.getDate() + daysToAdd);
+    return dueDate.toISOString();
+  }
+
+  // Productivity configuration methods
+  enableProductivityIntegration(type, config = {}) {
+    switch (type) {
+      case 'cloud-sync':
+        this.config.enableCloudSync = true;
+        this.config.productivityConfig.cloudStorage = { ...this.config.productivityConfig.cloudStorage, ...config, enabled: true };
+        break;
+      case 'team-notifications':
+        this.config.enableTeamNotifications = true;
+        this.config.productivityConfig.teamNotification = { ...this.config.productivityConfig.teamNotification, ...config, enabled: true };
+        break;
+      case 'project-management':
+        this.config.enableProjectManagement = true;
+        this.config.productivityConfig.projectManagement = { ...this.config.productivityConfig.projectManagement, ...config, enabled: true };
+        break;
+      case 'smart-backup':
+        this.config.enableSmartBackup = true;
+        this.config.productivityConfig.smartBackup = { ...this.config.productivityConfig.smartBackup, ...config, enabled: true };
+        break;
+    }
+    console.log(`✅ Enabled productivity integration: ${type}`);
+  }
+
+  disableProductivityIntegration(type) {
+    switch (type) {
+      case 'cloud-sync':
+        this.config.enableCloudSync = false;
+        this.config.productivityConfig.cloudStorage.enabled = false;
+        break;
+      case 'team-notifications':
+        this.config.enableTeamNotifications = false;
+        this.config.productivityConfig.teamNotification.enabled = false;
+        break;
+      case 'project-management':
+        this.config.enableProjectManagement = false;
+        this.config.productivityConfig.projectManagement.enabled = false;
+        break;
+      case 'smart-backup':
+        this.config.enableSmartBackup = false;
+        this.config.productivityConfig.smartBackup.enabled = false;
+        break;
+    }
+    console.log(`❌ Disabled productivity integration: ${type}`);
+  }
+
+  getProductivityIntegrations() {
+    return this.productivityService.getAvailableIntegrations();
+  }
+
+  getProductivityWorkflows() {
+    return this.productivityService.getProductivityWorkflows();
   }
 
   // Rule management

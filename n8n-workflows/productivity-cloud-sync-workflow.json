@@ -1,0 +1,241 @@
+{
+  "name": "Productivity Cloud Storage Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cloud-storage-sync",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-cloud-sync",
+      "name": "Webhook - Cloud Storage Sync",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "cloud-storage-sync-webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.target_integration }}",
+              "rightValue": "google-drive",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "route-by-provider",
+      "name": "Route by Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $json.folder_structure.replace('/', '') }}",
+          "mode": "name"
+        },
+        "inputDataFieldName": "file_path",
+        "options": {
+          "fileName": "={{ $json.file_name }}"
+        }
+      },
+      "id": "google-drive-upload",
+      "name": "Google Drive Upload",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [680, 200],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "google-drive-oauth",
+          "name": "Google Drive OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "path": "={{ $json.folder_structure }}",
+        "inputDataFieldName": "file_path",
+        "options": {
+          "fileName": "={{ $json.file_name }}"
+        }
+      },
+      "id": "dropbox-upload",
+      "name": "Dropbox Upload",
+      "type": "n8n-nodes-base.dropbox",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "credentials": {
+        "dropboxOAuth2Api": {
+          "id": "dropbox-oauth",
+          "name": "Dropbox OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "path": "={{ $json.folder_structure }}",
+        "inputDataFieldName": "file_path",
+        "options": {
+          "fileName": "={{ $json.file_name }}"
+        }
+      },
+      "id": "onedrive-upload",
+      "name": "OneDrive Upload",
+      "type": "n8n-nodes-base.microsoftOneDrive",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "microsoftOneDriveOAuth2Api": {
+          "id": "onedrive-oauth",
+          "name": "OneDrive OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst result = [];\n\nfor (const item of items) {\n  const success = item.json.success !== false;\n  const response = {\n    success: success,\n    file_name: item.json.file_name || $('Webhook - Cloud Storage Sync').first().json.file_name,\n    cloud_url: item.json.webViewLink || item.json.url || item.json.webUrl || null,\n    share_url: item.json.shareUrl || item.json.webViewLink || null,\n    provider: $('Webhook - Cloud Storage Sync').first().json.target_integration,\n    message: success ? 'File synced successfully to cloud storage' : 'Cloud sync failed',\n    timestamp: new Date().toISOString()\n  };\n  \n  result.push({ json: response });\n}\n\nreturn result;"
+      },
+      "id": "format-response",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Cloud Storage Sync": {
+      "main": [
+        [
+          {
+            "node": "Route by Provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Provider": {
+      "main": [
+        [
+          {
+            "node": "Google Drive Upload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dropbox Upload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "OneDrive Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Drive Upload": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dropbox Upload": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OneDrive Upload": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "flowgenius-productivity-integration"
+  },
+  "id": "productivity-cloud-sync",
+  "tags": [
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "cloud-storage",
+      "name": "cloud-storage"
+    },
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "productivity",
+      "name": "productivity"
+    }
+  ]
+} 
